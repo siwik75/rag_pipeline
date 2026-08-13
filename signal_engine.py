@@ -8,13 +8,18 @@ here is testable offline.
 Strategy (see docs/superpowers/specs/2026-08-12-deterministic-signal-engine-design.md):
 
 1. Trend filter (must pass): EMA9 > EMA21 > EMA50 for LONG (mirrored for
-   SHORT) plus ADX > 20 with DI+/DI- agreeing with the direction.
-2. Entry timing: last close within 0.5xATR of EMA21 (pullback zone) OR an
+   SHORT) plus ADX > 25 with DI+/DI- agreeing with the direction.
+2. Entry timing: last close within 0.75xATR of EMA21 (pullback zone) OR an
    EMA9/EMA21 crossover within the last 3 closed bars, plus an RSI guard
    (LONG 45-65, SHORT 35-55).
 3. Confluence score -> confidence: base 50, +8 per confirming indicator
    (MACD histogram, VWAP side, volume spike, OBV slope, 1d trend), cap 95.
-4. ATR-based trade plan: SL 1.2xATR, TP1 2.0xATR, TP2 3.5xATR.
+4. ATR-based trade plan: SL 2.0xATR, TP1 4.0xATR, TP2 7.0xATR.
+
+(Default parameters are the result of a grid sweep + walk-forward validation
+over ~13 months of 4h data on BTC/ETH/SOL/BNB — see the tuning notes in
+docs/superpowers/specs/2026-08-12-deterministic-signal-engine-design.md.
+Wide stops were decisively more robust across regimes than tight ones.)
 
 Indicator columns follow the naming of ``signal_check.compute_indicators``
 (``rsi_14``, ``atr_14``, ``adx``, ``di_plus``, ``di_minus``, ``macd_hist``,
@@ -37,23 +42,59 @@ optional keyword-only pass-through stored on the evaluation dict so that
 """
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+
 import pandas as pd
 import ta
 
 # ----------------------------------------------------------------- tunables
 
-ATR_SL_MULT = 1.2
-ATR_TP1_MULT = 2.0
-ATR_TP2_MULT = 3.5
-ADX_MIN = 20
+ATR_SL_MULT = 2.0
+ATR_TP1_MULT = 4.0
+ATR_TP2_MULT = 7.0
+ADX_MIN = 25
 RSI_LONG = (45, 65)
 RSI_SHORT = (35, 55)
 CONFLUENCE_BASE = 50
 CONFLUENCE_STEP = 8
 CONFIDENCE_CAP = 95
-PULLBACK_ATR_FRAC = 0.5
+PULLBACK_ATR_FRAC = 0.75
 CROSS_LOOKBACK_BARS = 3
 VOLUME_MULT = 1.2
+REQUIRE_1D_ALIGNMENT = False  # hard filter: trade only with the daily trend
+
+
+@dataclass(frozen=True)
+class SignalParams:
+    """Tunable knobs for the engine; defaults are the module constants above.
+
+    Construct overrides from a dict with ``SignalParams(**{...})``; use
+    ``params_to_dict`` for a plain-dict echo (tuples become lists so the
+    result is JSON-serialisable).
+    """
+
+    ATR_SL_MULT: float = ATR_SL_MULT
+    ATR_TP1_MULT: float = ATR_TP1_MULT
+    ATR_TP2_MULT: float = ATR_TP2_MULT
+    ADX_MIN: float = ADX_MIN
+    RSI_LONG: tuple = RSI_LONG
+    RSI_SHORT: tuple = RSI_SHORT
+    CONFLUENCE_BASE: float = CONFLUENCE_BASE
+    CONFLUENCE_STEP: float = CONFLUENCE_STEP
+    CONFIDENCE_CAP: float = CONFIDENCE_CAP
+    PULLBACK_ATR_FRAC: float = PULLBACK_ATR_FRAC
+    CROSS_LOOKBACK_BARS: int = CROSS_LOOKBACK_BARS
+    VOLUME_MULT: float = VOLUME_MULT
+    REQUIRE_1D_ALIGNMENT: bool = REQUIRE_1D_ALIGNMENT
+
+
+DEFAULT_PARAMS = SignalParams()
+
+
+def params_to_dict(params: SignalParams) -> dict:
+    """Plain-dict view of a SignalParams (tuples -> lists for JSON safety)."""
+    return {k: list(v) if isinstance(v, tuple) else v
+            for k, v in asdict(params).items()}
 
 MIN_BARS = 60      # need EMA50 + ADX(14) warmup on the trading frame
 MIN_BARS_1D = 55   # need EMA50 warmup on the daily frame
@@ -105,10 +146,10 @@ def _daily_emas(df_1d: pd.DataFrame) -> tuple[float, float] | None:
 
 # ------------------------------------------------------------- evaluation
 
-def _cross_within(df: pd.DataFrame, direction: str) -> bool:
+def _cross_within(df: pd.DataFrame, direction: str, lookback: int) -> bool:
     """True if EMA9 crossed EMA21 (in ``direction``) within the last bars."""
     n = len(df)
-    for i in range(n - CROSS_LOOKBACK_BARS, n):
+    for i in range(n - lookback, n):
         prev_diff = df["ema_9"].iloc[i - 1] - df["ema_21"].iloc[i - 1]
         diff = df["ema_9"].iloc[i] - df["ema_21"].iloc[i]
         if direction == "LONG" and prev_diff <= 0 < diff:
@@ -124,6 +165,7 @@ def evaluate_symbol(
     *,
     min_confidence: float = 70.0,
     timeframe: str | None = None,
+    params: SignalParams | None = None,
 ) -> dict:
     """Evaluate one symbol on pre-fetched OHLCV data.
 
@@ -133,7 +175,11 @@ def evaluate_symbol(
     The LAST ROW IS ALWAYS DROPPED as a possibly in-progress candle (see
     module docstring). Returns a dict; never raises for ordinary "no signal"
     outcomes — check ``passed_filter`` / ``direction`` / ``reasons``.
+
+    ``params`` overrides the module-level tunables; None uses the defaults,
+    which is byte-for-byte the historical behaviour.
     """
+    p = params if params is not None else DEFAULT_PARAMS
     df = df.iloc[:-1].copy()
     if not all(col in df.columns for col in INDICATOR_COLUMNS):
         df = add_indicators(df)
@@ -195,31 +241,45 @@ def evaluate_symbol(
         reasons.append(
             f"no_ema_alignment (ema9={ema9:.6g}, ema21={ema21:.6g}, ema50={ema50:.6g})"
         )
-    if adx <= ADX_MIN:
-        reasons.append(f"adx_too_weak ({adx:.1f} <= {ADX_MIN})")
+    if adx <= p.ADX_MIN:
+        reasons.append(f"adx_too_weak ({adx:.1f} <= {p.ADX_MIN})")
     if ema_long and di_plus <= di_minus:
         reasons.append(f"di_disagrees_with_long (+DI {di_plus:.1f} <= -DI {di_minus:.1f})")
     if ema_short and di_minus <= di_plus:
         reasons.append(f"di_disagrees_with_short (-DI {di_minus:.1f} <= +DI {di_plus:.1f})")
 
     direction = "NONE"
-    if ema_long and adx > ADX_MIN and di_plus > di_minus:
+    if ema_long and adx > p.ADX_MIN and di_plus > di_minus:
         direction = "LONG"
-    elif ema_short and adx > ADX_MIN and di_minus > di_plus:
+    elif ema_short and adx > p.ADX_MIN and di_minus > di_plus:
         direction = "SHORT"
     if direction == "NONE":
         return result
 
+    # --- 1b. hard daily-trend alignment filter ----------------------------
+    daily = _daily_emas(df_1d)
+    if p.REQUIRE_1D_ALIGNMENT and daily is not None:
+        ema20_1d, ema50_1d = daily
+        result["indicators"]["ema20_1d"] = ema20_1d
+        result["indicators"]["ema50_1d"] = ema50_1d
+        aligned = ema20_1d > ema50_1d if direction == "LONG" else ema20_1d < ema50_1d
+        if not aligned:
+            reasons.append(
+                f"daily_trend_misaligned ({direction} vs 1d EMA20 "
+                f"{ema20_1d:.6g} {'>' if direction == 'LONG' else '<'} EMA50 {ema50_1d:.6g})"
+            )
+            return result
+
     # --- 2. entry timing -------------------------------------------------
-    pullback = abs(close - ema21) <= PULLBACK_ATR_FRAC * atr
-    cross = _cross_within(df, direction)
+    pullback = abs(close - ema21) <= p.PULLBACK_ATR_FRAC * atr
+    cross = _cross_within(df, direction, p.CROSS_LOOKBACK_BARS)
     if not (pullback or cross):
         reasons.append(
             f"no_entry_timing (|close-ema21|={abs(close - ema21):.6g} > "
-            f"{PULLBACK_ATR_FRAC}xATR={PULLBACK_ATR_FRAC * atr:.6g}, no EMA9/21 cross "
-            f"in last {CROSS_LOOKBACK_BARS} bars)"
+            f"{p.PULLBACK_ATR_FRAC}xATR={p.PULLBACK_ATR_FRAC * atr:.6g}, no EMA9/21 cross "
+            f"in last {p.CROSS_LOOKBACK_BARS} bars)"
         )
-    rsi_lo, rsi_hi = RSI_LONG if direction == "LONG" else RSI_SHORT
+    rsi_lo, rsi_hi = p.RSI_LONG if direction == "LONG" else p.RSI_SHORT
     if not (rsi_lo <= rsi <= rsi_hi):
         reasons.append(f"rsi_outside_guard (rsi={rsi:.1f} not in [{rsi_lo}, {rsi_hi}])")
     if reasons:
@@ -242,7 +302,7 @@ def evaluate_symbol(
     checks.append(("price_above_vwap" if direction == "LONG" else "price_below_vwap",
                    "price_wrong_side_of_vwap", vwap_ok))
     checks.append(("volume_above_average", "volume_below_average",
-                   volume > VOLUME_MULT * vol_sma))
+                   volume > p.VOLUME_MULT * vol_sma))
     obv_ok = obv_slope_5 > 0 if direction == "LONG" else obv_slope_5 < 0
     checks.append(("obv_slope_confirms", "obv_slope_divergent", obv_ok))
 
@@ -263,14 +323,14 @@ def evaluate_symbol(
         else:
             result["divergent_indicators"].append(miss_name)
     result["confidence"] = float(
-        min(CONFIDENCE_CAP, CONFLUENCE_BASE + CONFLUENCE_STEP * hits)
+        min(p.CONFIDENCE_CAP, p.CONFLUENCE_BASE + p.CONFLUENCE_STEP * hits)
     )
     return result
 
 
 # ------------------------------------------------------------- trade plan
 
-def _build_reasoning(ev: dict, plan: dict) -> str:
+def _build_reasoning(ev: dict, plan: dict, p: SignalParams) -> str:
     ind = ev["indicators"]
     direction = ev["direction"]
     return (
@@ -278,7 +338,7 @@ def _build_reasoning(ev: dict, plan: dict) -> str:
         f"EMA stack aligned (EMA9 {ind['ema9']:.6g} "
         f"{'>' if direction == 'LONG' else '<'} EMA21 {ind['ema21']:.6g} "
         f"{'>' if direction == 'LONG' else '<'} EMA50 {ind['ema50']:.6g}), "
-        f"ADX {ind['adx']:.1f} > {ADX_MIN} with "
+        f"ADX {ind['adx']:.1f} > {p.ADX_MIN} with "
         f"{'+DI' if direction == 'LONG' else '-DI'} leading "
         f"(+DI {ind['di_plus']:.1f} / -DI {ind['di_minus']:.1f}). "
         f"Entry via {ev['entry_type']} at close {ind['close']:.6g}, "
@@ -291,19 +351,25 @@ def _build_reasoning(ev: dict, plan: dict) -> str:
             else "."
         )
         + f" ATR {ind['atr']:.6g} sizes the risk: SL {plan['stop_loss']:.6g} "
-        f"({ATR_SL_MULT}xATR), TP1 {plan['take_profit_1']:.6g} ({ATR_TP1_MULT}xATR, "
+        f"({p.ATR_SL_MULT}xATR), TP1 {plan['take_profit_1']:.6g} ({p.ATR_TP1_MULT}xATR, "
         f"RR {plan['risk_reward_tp1']:.2f}), TP2 {plan['take_profit_2']:.6g} "
-        f"({ATR_TP2_MULT}xATR, RR {plan['risk_reward_tp2']:.2f})."
+        f"({p.ATR_TP2_MULT}xATR, RR {plan['risk_reward_tp2']:.2f})."
     )
 
 
-def build_trade_plan(evaluation: dict) -> dict | None:
+def build_trade_plan(
+    evaluation: dict,
+    *,
+    params: SignalParams | None = None,
+) -> dict | None:
     """Turn a passing ``evaluate_symbol`` result into a strategist-shaped plan.
 
     Returns None when the evaluation did not pass the filter or its
     confidence is below ``min_confidence`` (read back from the evaluation
-    dict, defaulting to 70.0).
+    dict, defaulting to 70.0). ``params`` overrides the module-level
+    SL/TP tunables; None uses the defaults.
     """
+    p = params if params is not None else DEFAULT_PARAMS
     if not evaluation.get("passed_filter"):
         return None
     confidence = float(evaluation["confidence"])
@@ -315,9 +381,9 @@ def build_trade_plan(evaluation: dict) -> dict | None:
     entry = ind["close"]
     atr = ind["atr"]
     sign = 1.0 if direction == "LONG" else -1.0
-    stop_loss = entry - sign * ATR_SL_MULT * atr
-    take_profit_1 = entry + sign * ATR_TP1_MULT * atr
-    take_profit_2 = entry + sign * ATR_TP2_MULT * atr
+    stop_loss = entry - sign * p.ATR_SL_MULT * atr
+    take_profit_1 = entry + sign * p.ATR_TP1_MULT * atr
+    take_profit_2 = entry + sign * p.ATR_TP2_MULT * atr
     risk = abs(entry - stop_loss)
     rr_tp1 = abs(take_profit_1 - entry) / risk
     rr_tp2 = abs(take_profit_2 - entry) / risk
@@ -363,7 +429,7 @@ def build_trade_plan(evaluation: dict) -> dict | None:
             "volume_ratio": ind["volume_ratio"],
         },
     }
-    plan["reasoning"] = _build_reasoning(evaluation, plan)
+    plan["reasoning"] = _build_reasoning(evaluation, plan, p)
     return plan
 
 
@@ -376,6 +442,7 @@ def scan_symbols(
     min_confidence: float = 70.0,
     cooldown_symbols: set[str] | None = None,
     timeframe: str | None = None,
+    params: SignalParams | None = None,
 ) -> dict:
     """Evaluate every symbol in ``data`` and pick the best trade plan.
 
@@ -383,7 +450,9 @@ def scan_symbols(
     are collected in ``errors`` and never abort the scan. Candidates are
     ranked by confidence (ties -> higher risk_reward_tp1). Returns
     ``{"best": plan | None, "scores": [...], "errors": [...]}``.
+    ``params`` overrides the module-level tunables; None uses the defaults.
     """
+    p = params if params is not None else DEFAULT_PARAMS
     cooldown = cooldown_symbols or set()
     scores: list[dict] = []
     errors: list[dict] = []
@@ -398,6 +467,7 @@ def scan_symbols(
                 (data_1d or {}).get(symbol),
                 min_confidence=min_confidence,
                 timeframe=timeframe,
+                params=p,
             )
         except Exception as exc:  # per-symbol failure must not abort the scan
             errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
@@ -415,11 +485,11 @@ def scan_symbols(
 
     def _rank_key(ev: dict) -> tuple[float, float]:
         atr = ev["indicators"]["atr"]
-        rr_tp1 = (ATR_TP1_MULT * atr) / (ATR_SL_MULT * atr) if atr else 0.0
+        rr_tp1 = (p.ATR_TP1_MULT * atr) / (p.ATR_SL_MULT * atr) if atr else 0.0
         return (ev["confidence"], rr_tp1)
 
     best = None
     if candidates:
-        best = build_trade_plan(max(candidates, key=_rank_key))
+        best = build_trade_plan(max(candidates, key=_rank_key), params=p)
 
     return {"best": best, "scores": scores, "errors": errors}

@@ -7,6 +7,8 @@ Two layers:
 - integration tests that run the full ``add_indicators`` compute path on
   synthetic OHLCV random walks (fixed seeds, searched deterministically).
 """
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -281,6 +283,58 @@ class TestScan:
         assert out["best"] is not None
         assert len(out["errors"]) == 1
         assert out["errors"][0]["symbol"] == "BROKEN/USDT"
+
+
+# ------------------------------------------------------ integration tests
+
+class TestSignalParams:
+    def test_defaults_match_module_constants(self):
+        p = se.SignalParams()
+        assert p.ATR_SL_MULT == se.ATR_SL_MULT
+        assert p.ATR_TP1_MULT == se.ATR_TP1_MULT
+        assert p.ATR_TP2_MULT == se.ATR_TP2_MULT
+        assert p.ADX_MIN == se.ADX_MIN
+        assert p.RSI_LONG == se.RSI_LONG
+        assert p.RSI_SHORT == se.RSI_SHORT
+        assert p.CONFLUENCE_BASE == se.CONFLUENCE_BASE
+        assert p.CONFLUENCE_STEP == se.CONFLUENCE_STEP
+        assert p.CONFIDENCE_CAP == se.CONFIDENCE_CAP
+        assert p.PULLBACK_ATR_FRAC == se.PULLBACK_ATR_FRAC
+        assert p.CROSS_LOOKBACK_BARS == se.CROSS_LOOKBACK_BARS
+        assert p.VOLUME_MULT == se.VOLUME_MULT
+
+    def test_wider_sl_changes_plan_prices(self):
+        ev = se.evaluate_symbol(make_frame(direction="long"), timeframe="4h")
+        default_plan = se.build_trade_plan(ev)
+        wide = se.SignalParams(ATR_SL_MULT=se.ATR_SL_MULT + 1.0,
+                               ATR_TP1_MULT=se.ATR_TP1_MULT + 1.0)
+        wide_plan = se.build_trade_plan(ev, params=wide)
+        assert wide_plan["stop_loss"] == pytest.approx(
+            CLOSE - (se.ATR_SL_MULT + 1.0) * ATR)
+        assert wide_plan["take_profit_1"] == pytest.approx(
+            CLOSE + (se.ATR_TP1_MULT + 1.0) * ATR)
+        assert wide_plan["stop_loss"] < default_plan["stop_loss"]
+        assert wide_plan["risk_reward_tp1"] == pytest.approx(
+            (se.ATR_TP1_MULT + 1.0) / (se.ATR_SL_MULT + 1.0))
+
+    def test_params_change_filter_behavior(self):
+        # ADX 30 passes the default threshold but not a raised one (35)
+        frame = make_frame(direction="long", adx=30.0)
+        assert se.evaluate_symbol(frame)["passed_filter"] is True
+        ev = se.evaluate_symbol(frame, params=se.SignalParams(ADX_MIN=35))
+        assert ev["passed_filter"] is False
+        assert any("adx_too_weak" in r for r in ev["reasons"])
+
+    def test_scan_symbols_threads_params(self):
+        data = {"GOOD/USDT": make_frame(direction="long")}
+        out = se.scan_symbols(data, params=se.SignalParams(ATR_SL_MULT=2.0))
+        assert out["best"]["stop_loss"] == pytest.approx(CLOSE - 2.0 * ATR)
+
+    def test_params_to_dict_is_json_safe(self):
+        d = se.params_to_dict(se.SignalParams())
+        assert d["RSI_LONG"] == [45, 65]
+        assert d["ATR_SL_MULT"] == se.ATR_SL_MULT
+        json.dumps(d)
 
 
 # ------------------------------------------------------ integration tests
