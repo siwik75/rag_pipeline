@@ -212,21 +212,10 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
     At timestamp ``t`` the model sees only the 1,440 rows immediately before
     ``t``; ``t`` is used solely to calculate the current residual and z-score.
     """
-    clean = _valid_history(hourly, PairsParams(
+    clean = _valid_history(hourly, replace(
+        params,
         formation_hours=max(len(hourly), params.formation_hours),
-        residual_history_hours=params.residual_history_hours,
-        min_observations=params.min_observations,
-        min_return_correlation=params.min_return_correlation,
-        max_adf_pvalue=params.max_adf_pvalue,
-        min_half_life_hours=params.min_half_life_hours,
-        max_half_life_hours=params.max_half_life_hours,
-        max_beta_change=params.max_beta_change,
-        entry_z=params.entry_z,
-        confirm_reversion=params.confirm_reversion,
-        confirmation_bars=params.confirmation_bars,
-        convergence_z=params.convergence_z,
-        stop_z=params.stop_z,
-        max_holding_hours=params.max_holding_hours,
+        min_observations=0,
     ))
     if clean is None:
         return pd.DataFrame(columns=["ts", "zscore", "direction", "snapshot", "beta"])
@@ -241,10 +230,11 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
             continue
         history = clean.iloc[max(0, index - params.formation_hours):index]
         baseline = snapshots.get(ts - pd.Timedelta(hours=24))
+        baseline_stable = baseline is not None and baseline.stable
         snapshot = fit_relationship(
             history,
             params,
-            prior_beta=baseline.beta if baseline is not None else None,
+            prior_beta=baseline.beta if baseline_stable else None,
         )
         if snapshot is not None and baseline is None:
             snapshot = replace(
@@ -264,9 +254,9 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
             zscore_value = (residual - snapshot.residual_mean) / snapshot.residual_std
             if np.isfinite(zscore_value):
                 zscore = float(zscore_value)
-                if zscore >= params.entry_z:
+                if baseline_stable and zscore >= params.entry_z:
                     direction = "SHORT_ALT_LONG_BTC"
-                elif zscore <= -params.entry_z:
+                elif baseline_stable and zscore <= -params.entry_z:
                     direction = "LONG_ALT_SHORT_BTC"
         rows.append(_snapshot_row(PairObservation(ts, snapshot, zscore, direction)))
 

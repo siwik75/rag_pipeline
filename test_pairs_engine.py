@@ -34,11 +34,14 @@ def test_fit_uses_only_history_before_decision():
     hourly = make_cointegrated_hourly(hours=1_500)
     first = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
     mutated = hourly.copy()
-    mutated.loc[mutated.index >= 1_440, "alt_close"] *= 100.0
+    mutation_index = 1_470
+    mutated.loc[mutated.index >= mutation_index, "alt_close"] *= 100.0
     second = pe.build_hourly_observations(mutated, pe.DEFAULT_PARAMS)
+    compared = first.loc[first["ts"] < hourly.loc[mutation_index, "ts"]]
+    assert compared["snapshot"].notna().any()
     pd.testing.assert_series_equal(
-        first.loc[first["ts"] < hourly.loc[1_440, "ts"], "beta"],
-        second.loc[second["ts"] < hourly.loc[1_440, "ts"], "beta"],
+        compared["beta"],
+        second.loc[second["ts"] < hourly.loc[mutation_index, "ts"], "beta"],
         check_names=False,
     )
 
@@ -56,6 +59,32 @@ def test_observations_wait_for_a_full_formation_window():
     observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
     early = observations.loc[observations["ts"] < hourly.loc[1_440, "ts"]]
     assert early["snapshot"].isna().all()
+
+
+def test_unstable_baseline_cannot_emit_direction():
+    hourly = make_cointegrated_hourly(hours=1_500)
+    current_index = 1_464
+    hourly.loc[current_index, "alt_close"] *= 1.05
+
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+    baseline = observations.loc[1_440, "snapshot"]
+    current = observations.loc[current_index]
+
+    assert baseline is not None
+    assert baseline.stable is False
+    assert current["snapshot"].stable is True
+    assert abs(current["zscore"]) >= pe.DEFAULT_PARAMS.entry_z
+    assert current["direction"] is None
+
+
+def test_short_input_keeps_timestamps_with_null_observations():
+    hourly = make_cointegrated_hourly(hours=1_199)
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+
+    pd.testing.assert_series_equal(observations["ts"], hourly["ts"], check_names=False)
+    assert observations["snapshot"].isna().all()
+    assert observations["zscore"].isna().all()
+    assert observations["direction"].isna().all()
 
 
 def test_singular_nonpositive_or_short_history_is_rejected():
