@@ -1,8 +1,82 @@
 """Tests for the causal hourly relative-value relationship model."""
 import numpy as np
 import pandas as pd
+import pytest
 
 import pairs_engine as pe
+
+
+def make_observation(zscore: float | None, beta: float, stable: bool = True) -> pe.PairObservation:
+    snapshot = pe.RelationshipSnapshot(
+        alpha=0.3,
+        beta=beta,
+        residual=0.0,
+        residual_mean=0.0,
+        residual_std=0.01,
+        return_correlation=0.9,
+        adf_pvalue=0.01,
+        half_life_hours=12.0,
+        observations=1_440,
+        beta_change=0.0,
+        stable=stable,
+        rejection_reason=None if stable else "beta_change",
+    )
+    return pe.PairObservation(
+        ts=pd.Timestamp("2024-01-01T00:00:00Z"),
+        snapshot=snapshot,
+        zscore=zscore,
+        direction=None,
+    )
+
+
+def make_signal(zscore: float, beta: float) -> pe.PairSignal:
+    return pe.PairSignal(
+        pair="ETHUSDT/BTCUSDT",
+        decision_ts=pd.Timestamp("2024-01-01T00:00:00Z"),
+        beta=beta,
+        zscore=zscore,
+        alt_side="SHORT" if zscore > 0 else "LONG",
+        btc_side="LONG" if zscore > 0 else "SHORT",
+        alt_weight=1 / (1 + abs(beta)),
+        btc_weight=abs(beta) / (1 + abs(beta)),
+    )
+
+
+def exit_case(reason: str) -> dict[str, object]:
+    entry_ts = pd.Timestamp("2024-01-01T00:00:00Z")
+    cases = {
+        "convergence": {
+            "zscore": 0.5,
+            "stable": True,
+            "decision_ts": entry_ts + pd.Timedelta(hours=1),
+            "consecutive_missing_bars": 0,
+        },
+        "divergence_stop": {
+            "zscore": 3.5,
+            "stable": True,
+            "decision_ts": entry_ts + pd.Timedelta(hours=1),
+            "consecutive_missing_bars": 0,
+        },
+        "time_stop": {
+            "zscore": 1.0,
+            "stable": True,
+            "decision_ts": entry_ts + pd.Timedelta(hours=72),
+            "consecutive_missing_bars": 0,
+        },
+        "structural": {
+            "zscore": 1.0,
+            "stable": False,
+            "decision_ts": entry_ts + pd.Timedelta(hours=1),
+            "consecutive_missing_bars": 0,
+        },
+        "data_gap": {
+            "zscore": 1.0,
+            "stable": True,
+            "decision_ts": entry_ts + pd.Timedelta(hours=1),
+            "consecutive_missing_bars": 2,
+        },
+    }
+    return {"entry_ts": entry_ts, **cases[reason]}
 
 
 def make_cointegrated_hourly(hours: int, beta: float = 1.2) -> pd.DataFrame:
@@ -91,3 +165,25 @@ def test_singular_nonpositive_or_short_history_is_rejected():
     assert pe.fit_relationship(make_cointegrated_hourly(hours=1_199), pe.DEFAULT_PARAMS) is None
     assert pe.fit_relationship(make_constant_btc_hourly(hours=1_500), pe.DEFAULT_PARAMS) is None
     assert pe.fit_relationship(make_negative_beta_hourly(hours=1_500), pe.DEFAULT_PARAMS) is None
+
+
+def test_signal_weights_and_directions_mirror_the_lagged_beta():
+    high = pe.make_signal(make_observation(zscore=2.25, beta=2.0), pe.DEFAULT_PARAMS)
+    low = pe.make_signal(make_observation(zscore=-2.25, beta=2.0), pe.DEFAULT_PARAMS)
+    assert (high.alt_side, high.btc_side, high.alt_weight, high.btc_weight) == ("SHORT", "LONG", 1 / 3, 2 / 3)
+    assert (low.alt_side, low.btc_side, low.alt_weight, low.btc_weight) == ("LONG", "SHORT", 1 / 3, 2 / 3)
+
+
+def test_confirmation_requires_reversion_then_expires_after_four_closed_bars():
+    pending = pe.PendingConfirmation(signal=make_signal(zscore=2.0, beta=1.0), bars_seen=0)
+    assert pe.advance_confirmation(pending, zscore=1.95, params=pe.DEFAULT_PARAMS).entered is False
+    entered = pe.advance_confirmation(pending, zscore=1.90, params=pe.DEFAULT_PARAMS)
+    assert entered.entered is True
+    for _ in range(4):
+        pending = pe.advance_confirmation(pending, zscore=2.10, params=pe.DEFAULT_PARAMS).pending
+    assert pending is None
+
+
+@pytest.mark.parametrize("reason", ["convergence", "divergence_stop", "time_stop", "structural", "data_gap"])
+def test_exit_classification_uses_only_pair_level_rules(reason):
+    assert pe.classify_exit(**exit_case(reason), params=pe.DEFAULT_PARAMS).reason == reason

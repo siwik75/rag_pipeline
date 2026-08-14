@@ -55,6 +55,35 @@ class PairObservation:
     direction: str | None
 
 
+@dataclass(frozen=True)
+class PairSignal:
+    pair: str
+    decision_ts: pd.Timestamp
+    beta: float
+    zscore: float
+    alt_side: str
+    btc_side: str
+    alt_weight: float
+    btc_weight: float
+
+
+@dataclass(frozen=True)
+class PendingConfirmation:
+    signal: PairSignal
+    bars_seen: int
+
+
+@dataclass(frozen=True)
+class ConfirmationResult:
+    pending: PendingConfirmation | None
+    entered: bool
+
+
+@dataclass(frozen=True)
+class PairExit:
+    reason: str
+
+
 def align_hourly_prices(alt_1h: pd.DataFrame, btc_1h: pd.DataFrame) -> pd.DataFrame:
     """Return finite positive alt and BTC closes joined on exact hourly timestamps."""
     required = {"ts", "close"}
@@ -261,3 +290,78 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
         rows.append(_snapshot_row(PairObservation(ts, snapshot, zscore, direction)))
 
     return pd.DataFrame(rows)
+
+
+def make_signal(observation: PairObservation, params: PairsParams) -> PairSignal | None:
+    """Create a pair-level entry setup from one stable hourly observation."""
+    snapshot = observation.snapshot
+    zscore = observation.zscore
+    if snapshot is None or not snapshot.stable or zscore is None:
+        return None
+    if not np.isfinite(zscore) or not np.isfinite(snapshot.beta):
+        return None
+    magnitude = abs(zscore)
+    if not params.entry_z <= magnitude < params.stop_z:
+        return None
+
+    beta_magnitude = abs(snapshot.beta)
+    denominator = 1.0 + beta_magnitude
+    alt_weight = 1.0 / denominator
+    btc_weight = beta_magnitude / denominator
+    if zscore > 0.0:
+        alt_side, btc_side = "SHORT", "LONG"
+    else:
+        alt_side, btc_side = "LONG", "SHORT"
+    return PairSignal(
+        pair="",
+        decision_ts=observation.ts,
+        beta=snapshot.beta,
+        zscore=float(zscore),
+        alt_side=alt_side,
+        btc_side=btc_side,
+        alt_weight=alt_weight,
+        btc_weight=btc_weight,
+    )
+
+
+def advance_confirmation(
+    pending: PendingConfirmation,
+    zscore: float | None,
+    params: PairsParams,
+) -> ConfirmationResult:
+    """Advance a pending setup by one closed 15m bar."""
+    if zscore is not None and np.isfinite(zscore):
+        if abs(zscore) <= abs(pending.signal.zscore) - params.confirm_reversion:
+            return ConfirmationResult(pending=None, entered=True)
+
+    bars_seen = pending.bars_seen + 1
+    if bars_seen >= params.confirmation_bars:
+        return ConfirmationResult(pending=None, entered=False)
+    return ConfirmationResult(
+        pending=PendingConfirmation(signal=pending.signal, bars_seen=bars_seen),
+        entered=False,
+    )
+
+
+def classify_exit(
+    *,
+    zscore: float | None,
+    stable: bool | None,
+    entry_ts: pd.Timestamp,
+    decision_ts: pd.Timestamp,
+    consecutive_missing_bars: int,
+    params: PairsParams,
+) -> PairExit | None:
+    """Return the first applicable pair-level exit in fixed priority order."""
+    if stable is not True:
+        return PairExit(reason="structural")
+    if consecutive_missing_bars > 1:
+        return PairExit(reason="data_gap")
+    if zscore is not None and np.isfinite(zscore):
+        if abs(zscore) >= params.stop_z:
+            return PairExit(reason="divergence_stop")
+        if abs(zscore) <= params.convergence_z:
+            return PairExit(reason="convergence")
+    if decision_ts - entry_ts >= pd.Timedelta(hours=params.max_holding_hours):
+        return PairExit(reason="time_stop")
+    return None
