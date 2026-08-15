@@ -1,4 +1,6 @@
 """Tests for the causal hourly relative-value relationship model."""
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -18,6 +20,8 @@ BASE_CONFIG = bc.PairsBacktestConfig(
     fee_bps=10.0,
     slippage_bps=2.0,
 )
+COMMON_START = pd.Timestamp("2023-01-01T00:00:00Z")
+COMMON_END = pd.Timestamp("2024-01-01T00:00:00Z")
 
 
 def _fifteen_minute_leg(zscores: list[float], *, btc: bool) -> pd.DataFrame:
@@ -177,6 +181,138 @@ def make_signal(zscore: float, beta: float) -> pe.PairSignal:
         alt_weight=1 / (1 + abs(beta)),
         btc_weight=abs(beta) / (1 + abs(beta)),
     )
+
+
+def make_summary_trade(
+    *,
+    pair: str = "ETHUSDT/BTCUSDT",
+    net_return: float = 0.01,
+    alt_side: str = "LONG",
+    realized_btc_beta: float = 0.05,
+    entry_offset: int = 0,
+) -> bc.PairTrade:
+    entry_ts = COMMON_START + pd.Timedelta(hours=entry_offset)
+    return bc.PairTrade(
+        pair=pair,
+        entry_ts=entry_ts,
+        exit_ts=entry_ts + pd.Timedelta(hours=12),
+        alt_side=alt_side,
+        btc_side="SHORT" if alt_side == "LONG" else "LONG",
+        alt_weight=0.5,
+        btc_weight=0.5,
+        entry_z=-2.1 if alt_side == "LONG" else 2.1,
+        exit_z=0.4,
+        exit_reason="convergence",
+        price_return=net_return + 0.0024,
+        fee_return=-0.002,
+        slippage_return=-0.0004,
+        funding_return=0.0,
+        execution_shock_return=0.0,
+        net_return=net_return,
+        realized_btc_beta=realized_btc_beta,
+        mfe_z=1.7,
+        mae_z=-0.2,
+        mfe_return=max(net_return, 0.0) + 0.003,
+        mae_return=min(net_return, 0.0) - 0.002,
+        funding_events=2,
+        forced_close=False,
+        gross_notional=1_000.0,
+        equity_before=10_000.0,
+        pnl=1_000.0 * net_return,
+    )
+
+
+def make_metrics(**overrides) -> dict[str, object]:
+    metrics = {
+        "completed_trades": 120,
+        "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 60,
+            "SOLUSDT/BTCUSDT": 60,
+        },
+        "profit_factor": 1.5,
+        "win_rate": 0.56,
+        "mean_net_return": 0.004,
+        "median_net_return": 0.003,
+        "max_drawdown": 0.10,
+        "absolute_realized_btc_beta": 0.10,
+        "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+                "completed_trades": 60,
+                "profit_factor": 1.3,
+                "mean_net_return": 0.003,
+                "gross_profit_contribution": 0.52,
+            },
+            "SOLUSDT/BTCUSDT": {
+                "completed_trades": 60,
+                "profit_factor": 1.2,
+                "mean_net_return": 0.002,
+                "gross_profit_contribution": 0.48,
+            },
+        },
+        "deflated_sharpe_probability": 0.97,
+        "bootstrap_mean_net_return_ci_95": [0.001, 0.006],
+        "cost_stress": {
+            "15bps_fee_5bps_slippage": {"mean_net_return": 0.0001},
+        },
+        "invalid_reasons": [],
+    }
+    metrics.update(overrides)
+    return metrics
+
+
+def make_trial(
+    phase: str, *, passed: bool, holdout_open: bool = False,
+) -> dict[str, object]:
+    return {
+        "trial_id": f"{phase}-trial",
+        "recorded_at": "2026-08-14T00:00:00+00:00",
+        "phase": phase,
+        "params": {},
+        "cost_config": {"fee_bps": 10.0, "slippage_bps": 2.0},
+        "dataset_hashes": {"all": "abc"},
+        "dataset_hash": "abc",
+        "common_start": COMMON_START.isoformat(),
+        "common_end": COMMON_END.isoformat(),
+        "metrics": make_metrics(),
+        "gate": {"passed": passed, "failed_conditions": [] if passed else ["profit_factor"]},
+        "invalid_reasons": [],
+        "holdout_open": holdout_open,
+    }
+
+
+def make_experiment_market_data() -> dict[str, bc.PairMarketData]:
+    def prices(symbol: str, timeframe: str) -> pd.DataFrame:
+        interval = pd.Timedelta(hours=1) if timeframe == "1h" else pd.Timedelta(minutes=15)
+        timestamps = [COMMON_START, COMMON_END - interval]
+        return pd.DataFrame({
+            "ts": timestamps,
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.0, 101.0],
+            "volume": [1_000.0, 1_000.0],
+            "symbol": [symbol, symbol],
+        })
+
+    funding = pd.DataFrame({
+        "ts": [COMMON_START, COMMON_END - pd.Timedelta(hours=8)],
+        "funding_rate": [0.0, 0.0],
+    })
+    result = {}
+    for pair in pe.FIXED_PAIRS:
+        alt_symbol, btc_symbol = pair.split("/")
+        result[pair] = bc.PairMarketData(
+            pair=pair,
+            alt_symbol=alt_symbol,
+            btc_symbol=btc_symbol,
+            alt_1h=prices(alt_symbol, "1h"),
+            btc_1h=prices(btc_symbol, "1h"),
+            alt_15m=prices(alt_symbol, "15m"),
+            btc_15m=prices(btc_symbol, "15m"),
+            alt_funding=funding,
+            btc_funding=funding,
+        )
+    return result
 
 
 def exit_case(reason: str) -> dict[str, object]:
@@ -1131,3 +1267,307 @@ def test_four_fill_fee_uses_actual_leg_weights_instead_of_half_constants():
         btc_weight=0.50,
         fee_rate=0.001,
     ) == pytest.approx(-0.0015)
+
+
+def test_walk_forward_reserves_the_final_ninety_common_days():
+    schedule = bc.build_walk_forward_schedule(COMMON_START, COMMON_END)
+
+    assert schedule.holdout_start == COMMON_END - pd.Timedelta(days=90)
+    assert all(window.end <= schedule.holdout_start for window in schedule.development_windows)
+    assert all(
+        window.end - window.start == pd.Timedelta(days=30)
+        for window in schedule.development_windows
+    )
+    assert all(
+        window.start - window.formation_start == pd.Timedelta(days=60)
+        for window in schedule.development_windows
+    )
+
+
+def test_walk_forward_rejects_less_than_three_hundred_sixty_common_days():
+    with pytest.raises(
+        ValueError,
+        match=r"insufficient common history: 359 days; need at least 360",
+    ):
+        bc.build_walk_forward_schedule(COMMON_START, COMMON_START + pd.Timedelta(days=359))
+
+
+def test_development_gate_blocks_holdout_when_any_fixed_threshold_fails():
+    decision = bc.development_gate(make_metrics(
+        completed_trades=59,
+        per_pair_trades={"ETHUSDT/BTCUSDT": 20, "SOLUSDT/BTCUSDT": 20},
+    ))
+
+    assert decision.passed is False
+    assert "completed_trades" in decision.failed_conditions
+
+
+def test_development_gate_accepts_every_threshold_at_its_inclusive_boundary():
+    metrics = make_metrics(
+        completed_trades=60,
+        per_pair_trades={"ETHUSDT/BTCUSDT": 20, "SOLUSDT/BTCUSDT": 20},
+        profit_factor=1.15,
+        win_rate=0.50,
+        max_drawdown=0.15,
+        absolute_realized_btc_beta=0.15,
+    )
+
+    assert bc.development_gate(metrics) == bc.GateDecision(True, [])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failed_condition"),
+    [
+        ({"profit_factor": 1.1499}, "profit_factor"),
+        ({"win_rate": 0.4999}, "win_rate"),
+        ({"max_drawdown": 0.1501}, "max_drawdown"),
+        ({"absolute_realized_btc_beta": 0.1501}, "absolute_realized_btc_beta"),
+        ({"invalid_reasons": ["missing_funding"]}, "invalid_reasons"),
+    ],
+)
+def test_development_gate_uses_inclusive_fixed_thresholds(mutation, failed_condition):
+    decision = bc.development_gate(make_metrics(**mutation))
+
+    assert decision.passed is False
+    assert failed_condition in decision.failed_conditions
+
+
+def test_hard_gate_checks_pair_concentration_stress_and_uncertainty():
+    metrics = make_metrics()
+    metrics["per_pair"] = {
+        **metrics["per_pair"],
+        "ETHUSDT/BTCUSDT": {
+            **metrics["per_pair"]["ETHUSDT/BTCUSDT"],
+            "gross_profit_contribution": 0.651,
+        },
+    }
+    metrics["cost_stress"] = {
+        "15bps_fee_5bps_slippage": {"mean_net_return": -0.00001},
+    }
+    metrics["bootstrap_mean_net_return_ci_95"] = [-0.001, 0.006]
+
+    decision = bc.hard_pass_gate(metrics)
+
+    assert decision.passed is False
+    assert {
+        "gross_profit_concentration",
+        "15bps_fee_5bps_slippage",
+        "bootstrap_mean_net_return_ci_95",
+    }.issubset(decision.failed_conditions)
+
+
+def test_hard_gate_accepts_inclusive_boundaries_and_rejects_invalid_reasons():
+    metrics = make_metrics(
+        completed_trades=100,
+        per_pair_trades={"ETHUSDT/BTCUSDT": 50, "SOLUSDT/BTCUSDT": 50},
+        profit_factor=1.25,
+        win_rate=0.52,
+        max_drawdown=0.15,
+        absolute_realized_btc_beta=0.15,
+        deflated_sharpe_probability=0.95,
+        bootstrap_mean_net_return_ci_95=[0.000001, 0.006],
+    )
+    metrics["per_pair"] = {
+        "ETHUSDT/BTCUSDT": {
+            "completed_trades": 50,
+            "profit_factor": 1.05,
+            "mean_net_return": 0.001,
+            "gross_profit_contribution": 0.65,
+        },
+        "SOLUSDT/BTCUSDT": {
+            "completed_trades": 50,
+            "profit_factor": 1.05,
+            "mean_net_return": 0.001,
+            "gross_profit_contribution": 0.35,
+        },
+    }
+    metrics["cost_stress"] = {
+        "15bps_fee_5bps_slippage": {"mean_net_return": 0.0},
+    }
+
+    assert bc.hard_pass_gate(metrics) == bc.GateDecision(True, [])
+    invalid = bc.hard_pass_gate({**metrics, "invalid_reasons": ["missing_funding"]})
+    assert invalid.passed is False
+    assert "invalid_reasons" in invalid.failed_conditions
+
+
+def test_ledger_retains_failed_trials_and_refuses_second_holdout_open(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    bc.write_trial_ledger(ledger, make_trial("development", passed=False))
+    bc.write_trial_ledger(
+        ledger,
+        make_trial("holdout", passed=True, holdout_open=True),
+    )
+
+    with pytest.raises(ValueError, match="already opened"):
+        bc.write_trial_ledger(
+            ledger,
+            {**make_trial("holdout", passed=True, holdout_open=True), "trial_id": "again"},
+        )
+
+    persisted = json.loads(ledger.read_text())
+    assert persisted["schema_version"] == 1
+    assert persisted["holdout"]["status"] == "opened"
+    assert [trial["gate"]["passed"] for trial in persisted["trials"]] == [False, True]
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_trade_summary_bootstrap_is_seeded_and_trial_penalty_is_monotone():
+    trades = [
+        make_summary_trade(
+            pair=pe.FIXED_PAIRS[index % 2],
+            net_return=(0.012, -0.004, 0.008, 0.003)[index % 4],
+            alt_side="LONG" if index % 2 == 0 else "SHORT",
+            entry_offset=index * 24,
+        )
+        for index in range(40)
+    ]
+
+    first = bc.summarize_pair_trades(trades, trial_count=1)
+    repeated = bc.summarize_pair_trades(trades, trial_count=1)
+    penalized = bc.summarize_pair_trades(trades, trial_count=50)
+
+    assert first["bootstrap_mean_net_return_ci_95"] == repeated[
+        "bootstrap_mean_net_return_ci_95"
+    ]
+    assert penalized["deflated_sharpe_probability"] <= first[
+        "deflated_sharpe_probability"
+    ]
+    assert first["per_pair_trades"] == {
+        "ETHUSDT/BTCUSDT": 20,
+        "SOLUSDT/BTCUSDT": 20,
+    }
+    assert set(first["exit_counts"]) == {
+        "convergence",
+        "divergence_stop",
+        "time_stop",
+        "structural",
+        "data_gap",
+        "window_boundary",
+    }
+
+
+def test_cost_stress_reprices_the_same_entry_exit_ledger():
+    trades = [
+        make_summary_trade(net_return=0.01),
+        make_summary_trade(
+            pair="SOLUSDT/BTCUSDT",
+            net_return=-0.004,
+            alt_side="SHORT",
+            entry_offset=24,
+        ),
+    ]
+
+    repriced = bc._reprice_pair_trades(
+        trades,
+        base_config=BASE_CONFIG,
+        fee_bps=15.0,
+        slippage_bps=5.0,
+    )
+
+    assert [(trade.pair, trade.entry_ts, trade.exit_ts, trade.exit_reason) for trade in repriced] == [
+        (trade.pair, trade.entry_ts, trade.exit_ts, trade.exit_reason) for trade in trades
+    ]
+    assert all(repriced_trade.net_return < original.net_return for repriced_trade, original in zip(repriced, trades))
+
+
+def test_dataset_hash_is_order_stable_and_value_sensitive():
+    left = pd.DataFrame({"ts": [TS0, TS1], "close": [100.0, 101.0]})
+    right = pd.DataFrame({"ts": [TS0, TS1], "close": [50.0, 51.0]})
+
+    expected = bc.dataset_hash({"left": left, "right": right})
+
+    assert bc.dataset_hash({"right": right, "left": left}) == expected
+    assert bc.dataset_hash({"left": left, "right": right.assign(close=[50.0, 52.0])}) != expected
+
+
+def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before_replay(
+    tmp_path, monkeypatch,
+):
+    calls = []
+
+    def replay(data, *, window_start, window_end, config, params):
+        calls.append((window_start, window_end, config.fee_bps, config.slippage_bps))
+        results = {}
+        for pair_index, pair in enumerate(pe.FIXED_PAIRS):
+            trades = [
+                make_summary_trade(
+                    pair=pair,
+                    net_return=-0.003 if trade_index == 0 else 0.008,
+                    alt_side="LONG" if trade_index % 2 == 0 else "SHORT",
+                    entry_offset=len(calls) * 24 + pair_index * 6 + trade_index,
+                )
+                for trade_index in range(5)
+            ]
+            results[pair] = bc.PairsBacktestResult(
+                pair=pair,
+                trades=trades,
+                metrics={},
+                invalid_reasons=[],
+            )
+        return results
+
+    monkeypatch.setattr(bc, "run_pairs_backtest", replay)
+    ledger_path = tmp_path / "ledger.json"
+
+    report = bc.run_pairs_experiment(
+        make_experiment_market_data(),
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=True,
+        ledger_path=ledger_path,
+    )
+
+    assert len(calls) == 8
+    assert all((fee_bps, slippage_bps) == (10.0, 2.0) for _, _, fee_bps, slippage_bps in calls)
+    assert report["development"]["gate"]["passed"] is True
+    assert report["holdout"]["opened"] is True
+    persisted = json.loads(ledger_path.read_text())
+    assert persisted["holdout"]["status"] == "opened"
+    assert [trial["phase"] for trial in persisted["trials"]] == ["development", "holdout"]
+    assert len(persisted["trials"][0]["cost_stress"]) == 9
+
+    with pytest.raises(ValueError, match="already opened"):
+        bc.run_pairs_experiment(
+            make_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=ledger_path,
+        )
+    assert len(calls) == 8
+
+
+def test_experiment_development_failure_keeps_holdout_sealed(tmp_path, monkeypatch):
+    calls = []
+
+    def replay(data, *, window_start, window_end, config, params):
+        calls.append((window_start, window_end))
+        return {
+            pair: bc.PairsBacktestResult(
+                pair=pair,
+                trades=[],
+                metrics={},
+                invalid_reasons=[],
+            )
+            for pair in pe.FIXED_PAIRS
+        }
+
+    monkeypatch.setattr(bc, "run_pairs_backtest", replay)
+    ledger_path = tmp_path / "ledger.json"
+
+    report = bc.run_pairs_experiment(
+        make_experiment_market_data(),
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=True,
+        ledger_path=ledger_path,
+    )
+
+    assert len(calls) == 7
+    assert report["development"]["gate"]["passed"] is False
+    assert report["holdout"] == {"requested": True, "opened": False, "status": "sealed"}
+    persisted = json.loads(ledger_path.read_text())
+    assert persisted["holdout"]["status"] == "sealed"
+    assert len(persisted["trials"]) == 1
+    assert persisted["trials"][0]["gate"]["passed"] is False

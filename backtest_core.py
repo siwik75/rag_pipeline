@@ -40,8 +40,12 @@ refetched. Callers that need warmup bars must include them in ``days``.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-from dataclasses import dataclass
+import os
+import uuid
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -281,6 +285,27 @@ class PairsBacktestResult:
     trades: list[PairTrade]
     metrics: dict[str, object]
     invalid_reasons: list[str]
+
+
+@dataclass(frozen=True)
+class WalkForwardWindow:
+    formation_start: pd.Timestamp
+    start: pd.Timestamp
+    end: pd.Timestamp
+
+
+@dataclass(frozen=True)
+class WalkForwardSchedule:
+    common_start: pd.Timestamp
+    common_end: pd.Timestamp
+    holdout_start: pd.Timestamp
+    development_windows: list[WalkForwardWindow]
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    passed: bool
+    failed_conditions: list[str]
 
 
 def _pairs_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -876,6 +901,796 @@ def run_pairs_backtest(
         )
         for pair in ordered_pairs
     }
+
+
+_PAIR_EXIT_REASONS = (
+    "convergence",
+    "divergence_stop",
+    "time_stop",
+    "structural",
+    "data_gap",
+    "window_boundary",
+)
+_COST_STRESS_GRID = tuple(
+    (fee_bps, slippage_bps)
+    for fee_bps in (5.0, 10.0, 15.0)
+    for slippage_bps in (1.0, 2.0, 5.0)
+)
+_LEDGER_SCHEMA = {
+    "schema_version": 1,
+    "holdout": {
+        "status": "sealed",
+        "opened_at": None,
+        "dataset_hash": None,
+        "trial_id": None,
+    },
+    "trials": [],
+}
+_TRIAL_FIELDS = {
+    "trial_id",
+    "recorded_at",
+    "phase",
+    "params",
+    "cost_config",
+    "dataset_hashes",
+    "common_start",
+    "common_end",
+    "metrics",
+    "gate",
+    "invalid_reasons",
+}
+
+
+def _utc_timestamp(value: pd.Timestamp) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    return (
+        timestamp.tz_localize("UTC") if timestamp.tzinfo is None
+        else timestamp.tz_convert("UTC")
+    )
+
+
+def build_walk_forward_schedule(
+    common_start: pd.Timestamp,
+    common_end: pd.Timestamp,
+) -> WalkForwardSchedule:
+    """Reserve a sealed holdout and build full, non-overlapping development windows."""
+    common_start = _utc_timestamp(common_start)
+    common_end = _utc_timestamp(common_end)
+    history = common_end - common_start
+    history_days = int(history // pd.Timedelta(days=1))
+    if history < pd.Timedelta(days=360):
+        raise ValueError(
+            f"insufficient common history: {history_days} days; need at least 360"
+        )
+
+    holdout_start = common_end - pd.Timedelta(days=90)
+    window_start = common_start + pd.Timedelta(days=60)
+    development_windows = []
+    while window_start + pd.Timedelta(days=30) <= holdout_start:
+        development_windows.append(WalkForwardWindow(
+            formation_start=window_start - pd.Timedelta(days=60),
+            start=window_start,
+            end=window_start + pd.Timedelta(days=30),
+        ))
+        window_start += pd.Timedelta(days=30)
+    return WalkForwardSchedule(
+        common_start=common_start,
+        common_end=common_end,
+        holdout_start=holdout_start,
+        development_windows=development_windows,
+    )
+
+
+def _profit_factor(returns: np.ndarray) -> float:
+    gross_profit = float(returns[returns > 0.0].sum())
+    gross_loss = float(-returns[returns < 0.0].sum())
+    if gross_loss > 0.0:
+        return gross_profit / gross_loss
+    return float("inf") if gross_profit > 0.0 else 0.0
+
+
+def _basic_pair_summary(trades: list[PairTrade]) -> dict[str, object]:
+    returns = np.asarray([trade.net_return for trade in trades], dtype=float)
+    pnls = np.asarray([trade.pnl for trade in trades], dtype=float)
+    gross_profit = float(sum(max(trade.pnl, 0.0) for trade in trades))
+    return {
+        "completed_trades": len(trades),
+        "profit_factor": _profit_factor(pnls),
+        "mean_net_return": float(returns.mean()) if len(returns) else 0.0,
+        "median_net_return": float(np.median(returns)) if len(returns) else 0.0,
+        "gross_profit": gross_profit,
+    }
+
+
+def _bootstrap_mean_ci(returns: np.ndarray) -> list[float | None]:
+    if not len(returns):
+        return [None, None]
+    block_length = max(1, round(math.sqrt(len(returns))))
+    block_count = math.ceil(len(returns) / block_length)
+    max_start = len(returns) - block_length
+    rng = np.random.default_rng(20260814)
+    means = np.empty(2_000, dtype=float)
+    for sample_index in range(2_000):
+        starts = rng.integers(0, max_start + 1, size=block_count)
+        sample = np.concatenate([
+            returns[start:start + block_length] for start in starts
+        ])[:len(returns)]
+        means[sample_index] = float(sample.mean())
+    return [
+        float(np.quantile(means, 0.025)),
+        float(np.quantile(means, 0.975)),
+    ]
+
+
+def _deflated_sharpe_probability(returns: np.ndarray, trial_count: int) -> float:
+    if len(returns) < 2:
+        return 0.0
+    standard_deviation = float(np.std(returns, ddof=1))
+    if not np.isfinite(standard_deviation) or standard_deviation <= 0.0:
+        return 1.0 if float(np.mean(returns)) > 0.0 else 0.0
+
+    from scipy.stats import norm
+
+    sharpe = float(np.mean(returns) / standard_deviation)
+    trials = max(int(trial_count), 1)
+    benchmark = 0.0
+    if trials > 1:
+        euler_gamma = 0.5772156649015329
+        benchmark = float(
+            (1.0 - euler_gamma) * norm.ppf(1.0 - 1.0 / trials)
+            + euler_gamma * norm.ppf(1.0 - 1.0 / (trials * math.e))
+        ) / math.sqrt(max(len(returns) - 1, 1))
+
+    centered = returns - float(np.mean(returns))
+    population_std = float(np.std(returns, ddof=0))
+    if population_std <= 0.0:
+        return 0.0
+    skewness = float(np.mean((centered / population_std) ** 3))
+    kurtosis = float(np.mean((centered / population_std) ** 4))
+    denominator_squared = (
+        1.0 - skewness * sharpe + ((kurtosis - 1.0) / 4.0) * sharpe ** 2
+    )
+    if not np.isfinite(denominator_squared) or denominator_squared <= 0.0:
+        return 0.0
+    statistic = (
+        (sharpe - benchmark) * math.sqrt(len(returns) - 1)
+        / math.sqrt(denominator_squared)
+    )
+    return float(norm.cdf(statistic))
+
+
+def summarize_pair_trades(
+    trades: list[PairTrade], *, trial_count: int,
+) -> dict[str, object]:
+    """Return deterministic, JSON-safe diagnostics for one causal trade ledger."""
+    ordered = sorted(trades, key=lambda trade: (trade.exit_ts, trade.entry_ts, trade.pair))
+    returns = np.asarray([trade.net_return for trade in ordered], dtype=float)
+    pnls = np.asarray([trade.pnl for trade in ordered], dtype=float)
+    wins = int((returns > 0.0).sum())
+    sample_std = float(np.std(returns, ddof=1)) if len(returns) > 1 else 0.0
+    sharpe = (
+        float(np.mean(returns) / sample_std * math.sqrt(len(returns)))
+        if sample_std > 0.0 else 0.0
+    )
+
+    portfolio_returns = np.asarray([
+        trade.pnl / trade.equity_before if trade.equity_before > 0.0 else 0.0
+        for trade in ordered
+    ], dtype=float)
+    wealth = (
+        np.cumprod(1.0 + portfolio_returns)
+        if len(portfolio_returns) else np.asarray([], dtype=float)
+    )
+    if len(wealth):
+        wealth_with_origin = np.concatenate(([1.0], wealth))
+        peaks = np.maximum.accumulate(wealth_with_origin)
+        max_drawdown = float(np.max((peaks - wealth_with_origin) / peaks))
+    else:
+        max_drawdown = 0.0
+
+    durations = np.asarray([
+        max((trade.exit_ts - trade.entry_ts).total_seconds(), 0.0) / 3_600.0
+        for trade in ordered
+    ], dtype=float)
+    elapsed_hours = (
+        max((max(trade.exit_ts for trade in ordered) - min(
+            trade.entry_ts for trade in ordered
+        )).total_seconds(), 0.0) / 3_600.0
+        if ordered else 0.0
+    )
+    total_holding_hours = float(durations.sum())
+
+    beta_numerator = 0.0
+    beta_denominator = 0.0
+    for trade, duration in zip(ordered, durations):
+        if trade.realized_btc_beta is None or not np.isfinite(trade.realized_btc_beta):
+            continue
+        weight = trade.gross_notional * duration
+        beta_numerator += abs(trade.realized_btc_beta) * weight
+        beta_denominator += weight
+    absolute_realized_btc_beta = (
+        float(beta_numerator / beta_denominator) if beta_denominator > 0.0 else None
+    )
+
+    per_pair = {
+        pair: _basic_pair_summary([trade for trade in ordered if trade.pair == pair])
+        for pair in pairs_engine.FIXED_PAIRS
+    }
+    total_gross_profit = float(sum(summary["gross_profit"] for summary in per_pair.values()))
+    for summary in per_pair.values():
+        summary["gross_profit_contribution"] = (
+            float(summary["gross_profit"] / total_gross_profit)
+            if total_gross_profit > 0.0 else 0.0
+        )
+
+    def values(attribute: str) -> np.ndarray:
+        return np.asarray([getattr(trade, attribute) for trade in ordered], dtype=float)
+
+    components = {
+        component: {
+            "sum": float(values(component).sum()) if ordered else 0.0,
+            "mean": float(values(component).mean()) if ordered else 0.0,
+        }
+        for component in (
+            "price_return",
+            "fee_return",
+            "slippage_return",
+            "funding_return",
+            "execution_shock_return",
+        )
+    }
+    long_alt = sum(trade.alt_side == "LONG" for trade in ordered)
+    short_alt = sum(trade.alt_side == "SHORT" for trade in ordered)
+    return {
+        "completed_trades": len(ordered),
+        "wins": wins,
+        "win_rate": float(wins / len(ordered)) if ordered else 0.0,
+        "profit_factor": _profit_factor(pnls),
+        "mean_net_return": float(returns.mean()) if ordered else 0.0,
+        "median_net_return": float(np.median(returns)) if ordered else 0.0,
+        "total_net_return": float(returns.sum()) if ordered else 0.0,
+        "total_pnl": float(pnls.sum()) if ordered else 0.0,
+        "gross_profit": float(pnls[pnls > 0.0].sum()) if ordered else 0.0,
+        "gross_loss": float(-pnls[pnls < 0.0].sum()) if ordered else 0.0,
+        "sharpe": sharpe,
+        "deflated_sharpe_probability": _deflated_sharpe_probability(
+            returns, trial_count,
+        ),
+        "trial_count": max(int(trial_count), 1),
+        "max_drawdown": max_drawdown,
+        "total_holding_hours": total_holding_hours,
+        "mean_holding_hours": float(durations.mean()) if ordered else 0.0,
+        "median_holding_hours": float(np.median(durations)) if ordered else 0.0,
+        "exposure": min(total_holding_hours / elapsed_hours, 1.0) if elapsed_hours else 0.0,
+        "funding_events": sum(trade.funding_events for trade in ordered),
+        "forced_closes": sum(trade.forced_close for trade in ordered),
+        "mean_mfe_z": float(values("mfe_z").mean()) if ordered else 0.0,
+        "median_mfe_z": float(np.median(values("mfe_z"))) if ordered else 0.0,
+        "mean_mae_z": float(values("mae_z").mean()) if ordered else 0.0,
+        "median_mae_z": float(np.median(values("mae_z"))) if ordered else 0.0,
+        "mean_mfe_return": float(values("mfe_return").mean()) if ordered else 0.0,
+        "median_mfe_return": float(np.median(values("mfe_return"))) if ordered else 0.0,
+        "mean_mae_return": float(values("mae_return").mean()) if ordered else 0.0,
+        "median_mae_return": float(np.median(values("mae_return"))) if ordered else 0.0,
+        "return_components": components,
+        "absolute_realized_btc_beta": absolute_realized_btc_beta,
+        "long_alt_trades": long_alt,
+        "short_alt_trades": short_alt,
+        "long_alt_fraction": float(long_alt / len(ordered)) if ordered else 0.0,
+        "short_alt_fraction": float(short_alt / len(ordered)) if ordered else 0.0,
+        "exit_counts": {
+            reason: sum(trade.exit_reason == reason for trade in ordered)
+            for reason in dict.fromkeys(
+                (*_PAIR_EXIT_REASONS, *(trade.exit_reason for trade in ordered))
+            )
+        },
+        "per_pair_trades": {
+            pair: int(summary["completed_trades"]) for pair, summary in per_pair.items()
+        },
+        "per_pair": per_pair,
+        "leave_one_pair_out": {
+            pair: _basic_pair_summary([trade for trade in ordered if trade.pair != pair])
+            for pair in pairs_engine.FIXED_PAIRS
+        },
+        "bootstrap_block_length": max(1, round(math.sqrt(len(ordered)))) if ordered else 1,
+        "bootstrap_resamples": 2_000,
+        "bootstrap_mean_net_return_ci_95": _bootstrap_mean_ci(returns),
+    }
+
+
+def _numeric_at_least(metrics: dict[str, object], key: str, threshold: float) -> bool:
+    value = metrics.get(key)
+    return (
+        isinstance(value, (int, float))
+        and not np.isnan(value)
+        and value >= threshold
+    )
+
+
+def _numeric_at_most(metrics: dict[str, object], key: str, threshold: float) -> bool:
+    value = metrics.get(key)
+    return isinstance(value, (int, float)) and np.isfinite(value) and value <= threshold
+
+
+def development_gate(metrics: dict[str, object]) -> GateDecision:
+    failed = []
+    per_pair_trades = metrics.get("per_pair_trades", {})
+    per_pair = metrics.get("per_pair", {})
+    conditions = (
+        ("completed_trades", _numeric_at_least(metrics, "completed_trades", 60)),
+        ("per_pair_trades", all(
+            isinstance(per_pair_trades, dict) and per_pair_trades.get(pair, 0) >= 20
+            for pair in pairs_engine.FIXED_PAIRS
+        )),
+        ("profit_factor", _numeric_at_least(metrics, "profit_factor", 1.15)),
+        ("win_rate", _numeric_at_least(metrics, "win_rate", 0.50)),
+        ("per_pair_mean_net_return", all(
+            isinstance(per_pair, dict)
+            and isinstance(per_pair.get(pair), dict)
+            and per_pair[pair].get("mean_net_return", 0.0) > 0.0
+            for pair in pairs_engine.FIXED_PAIRS
+        )),
+        ("max_drawdown", _numeric_at_most(metrics, "max_drawdown", 0.15)),
+        ("absolute_realized_btc_beta", _numeric_at_most(
+            metrics, "absolute_realized_btc_beta", 0.15,
+        )),
+        ("invalid_reasons", not metrics.get("invalid_reasons")),
+    )
+    failed.extend(name for name, passed in conditions if not passed)
+    return GateDecision(passed=not failed, failed_conditions=failed)
+
+
+def hard_pass_gate(metrics: dict[str, object]) -> GateDecision:
+    failed = []
+    per_pair_trades = metrics.get("per_pair_trades", {})
+    per_pair = metrics.get("per_pair", {})
+    stress = metrics.get("cost_stress", {})
+    severe_stress = (
+        stress.get("15bps_fee_5bps_slippage", {}) if isinstance(stress, dict) else {}
+    )
+    bootstrap_ci = metrics.get("bootstrap_mean_net_return_ci_95", [None, None])
+    bootstrap_excludes_zero = (
+        isinstance(bootstrap_ci, (list, tuple))
+        and len(bootstrap_ci) == 2
+        and all(isinstance(value, (int, float)) for value in bootstrap_ci)
+        and (bootstrap_ci[0] > 0.0 or bootstrap_ci[1] < 0.0)
+    )
+    pair_quality = all(
+        isinstance(per_pair, dict)
+        and isinstance(per_pair.get(pair), dict)
+        and per_pair[pair].get("profit_factor", 0.0) >= 1.05
+        and per_pair[pair].get("mean_net_return", 0.0) > 0.0
+        for pair in pairs_engine.FIXED_PAIRS
+    )
+    concentration_ok = all(
+        isinstance(per_pair, dict)
+        and isinstance(per_pair.get(pair), dict)
+        and per_pair[pair].get("gross_profit_contribution", 1.0) <= 0.65
+        for pair in pairs_engine.FIXED_PAIRS
+    )
+    conditions = (
+        ("completed_trades", _numeric_at_least(metrics, "completed_trades", 100)),
+        ("per_pair_trades", all(
+            isinstance(per_pair_trades, dict) and per_pair_trades.get(pair, 0) >= 35
+            for pair in pairs_engine.FIXED_PAIRS
+        )),
+        ("profit_factor", _numeric_at_least(metrics, "profit_factor", 1.25)),
+        ("win_rate", _numeric_at_least(metrics, "win_rate", 0.52)),
+        ("mean_net_return", _numeric_at_least(metrics, "mean_net_return", 0.0)
+         and metrics.get("mean_net_return", 0.0) > 0.0),
+        ("median_net_return", _numeric_at_least(metrics, "median_net_return", 0.0)
+         and metrics.get("median_net_return", 0.0) > 0.0),
+        ("per_pair_quality", pair_quality),
+        ("max_drawdown", _numeric_at_most(metrics, "max_drawdown", 0.15)),
+        ("absolute_realized_btc_beta", _numeric_at_most(
+            metrics, "absolute_realized_btc_beta", 0.15,
+        )),
+        ("gross_profit_concentration", concentration_ok),
+        ("15bps_fee_5bps_slippage", isinstance(severe_stress, dict)
+         and severe_stress.get("mean_net_return", -math.inf) >= 0.0),
+        ("deflated_sharpe_probability", _numeric_at_least(
+            metrics, "deflated_sharpe_probability", 0.95,
+        )),
+        ("bootstrap_mean_net_return_ci_95", bootstrap_excludes_zero),
+        ("invalid_reasons", not metrics.get("invalid_reasons")),
+    )
+    failed.extend(name for name, passed in conditions if not passed)
+    return GateDecision(passed=not failed, failed_conditions=failed)
+
+
+def dataset_hash(frames: dict[str, pd.DataFrame]) -> str:
+    """Hash named frame contents deterministically, independent of mapping order."""
+    digest = hashlib.sha256()
+    for name in sorted(frames):
+        frame = frames[name].copy()
+        digest.update(name.encode("utf-8"))
+        digest.update(json.dumps(list(frame.columns), separators=(",", ":")).encode("utf-8"))
+        digest.update(json.dumps(
+            [str(dtype) for dtype in frame.dtypes], separators=(",", ":"),
+        ).encode("utf-8"))
+        digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    return digest.hexdigest()
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, pd.Timestamp):
+        return _utc_timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _new_ledger() -> dict[str, object]:
+    return json.loads(json.dumps(_LEDGER_SCHEMA))
+
+
+def _read_trial_ledger(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return _new_ledger()
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    if ledger.get("schema_version") != 1:
+        raise ValueError("unsupported trial ledger schema")
+    if not isinstance(ledger.get("trials"), list) or not isinstance(ledger.get("holdout"), dict):
+        raise ValueError("invalid trial ledger")
+    return ledger
+
+
+def _write_ledger_document(path: Path, ledger: dict[str, object]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(_json_safe(ledger), handle, indent=2, sort_keys=True, allow_nan=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def write_trial_ledger(path: Path, trial: dict[str, object]) -> None:
+    """Append every trial atomically and irreversibly consume a holdout opening."""
+    missing = _TRIAL_FIELDS - set(trial)
+    if missing:
+        raise ValueError(f"trial missing required fields: {sorted(missing)}")
+    ledger = _read_trial_ledger(Path(path))
+    if trial.get("holdout_open"):
+        if ledger["holdout"].get("status") != "sealed":
+            raise ValueError("holdout already opened")
+        ledger["holdout"] = {
+            "status": "opened",
+            "opened_at": trial["recorded_at"],
+            "dataset_hash": trial.get("dataset_hash")
+            or trial.get("dataset_hashes", {}).get("all"),
+            "trial_id": trial["trial_id"],
+        }
+    ledger["trials"].append(_json_safe(trial))
+    _write_ledger_document(Path(path), ledger)
+
+
+def _reserve_holdout(
+    path: Path, *, dataset_digest: str, trial_id: str, opened_at: str,
+) -> None:
+    ledger = _read_trial_ledger(path)
+    if ledger["holdout"].get("status") != "sealed":
+        raise ValueError("holdout already opened")
+    ledger["holdout"] = {
+        "status": "opened",
+        "opened_at": opened_at,
+        "dataset_hash": dataset_digest,
+        "trial_id": trial_id,
+    }
+    _write_ledger_document(path, ledger)
+
+
+def _reprice_pair_trades(
+    trades: list[PairTrade], *, base_config: PairsBacktestConfig,
+    fee_bps: float, slippage_bps: float,
+) -> list[PairTrade]:
+    """Reprice costs without changing any causal trade identity or gross return."""
+    repriced = []
+    for trade in trades:
+        fee_return = _four_fill_fee_return(
+            alt_weight=trade.alt_weight,
+            btc_weight=trade.btc_weight,
+            fee_rate=float(fee_bps) / 10_000.0,
+        )
+        if base_config.slippage_bps:
+            slippage_return = (
+                trade.slippage_return * float(slippage_bps) / float(base_config.slippage_bps)
+            )
+        else:
+            slippage_return = (
+                -2.0 * float(slippage_bps) / 10_000.0
+                * (trade.alt_weight + trade.btc_weight)
+            )
+        net_return = (
+            trade.price_return + fee_return + slippage_return
+            + trade.funding_return + trade.execution_shock_return
+        )
+        repriced.append(replace(
+            trade,
+            fee_return=float(fee_return),
+            slippage_return=float(slippage_return),
+            net_return=float(net_return),
+            pnl=float(trade.gross_notional * net_return),
+        ))
+    return repriced
+
+
+def _cost_stress_metrics(
+    trades: list[PairTrade], *, base_config: PairsBacktestConfig, trial_count: int,
+) -> dict[str, dict[str, object]]:
+    stress = {}
+    for fee_bps, slippage_bps in _COST_STRESS_GRID:
+        key = f"{fee_bps:g}bps_fee_{slippage_bps:g}bps_slippage"
+        stress[key] = summarize_pair_trades(
+            _reprice_pair_trades(
+                trades,
+                base_config=base_config,
+                fee_bps=fee_bps,
+                slippage_bps=slippage_bps,
+            ),
+            trial_count=trial_count,
+        )
+    return stress
+
+
+def _research_frames(
+    data: dict[str, PairMarketData],
+) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    if set(data) != set(pairs_engine.FIXED_PAIRS):
+        raise ValueError(f"pairs experiment requires exactly {pairs_engine.FIXED_PAIRS}")
+    hash_frames = {}
+    interval_frames = {}
+    for pair in pairs_engine.FIXED_PAIRS:
+        market = data[pair]
+        alt_symbol, btc_symbol = pair.split("/")
+        if (
+            market.pair != pair
+            or market.alt_symbol != alt_symbol
+            or market.btc_symbol != btc_symbol
+        ):
+            raise ValueError(f"noncanonical market identity for {pair}")
+        for leg, timeframe, frame in (
+            ("alt", "1h", market.alt_1h),
+            ("btc", "1h", market.btc_1h),
+            ("alt", "15m", market.alt_15m),
+            ("btc", "15m", market.btc_15m),
+        ):
+            name = f"{pair}:{leg}:{timeframe}"
+            normalized = _pairs_frame(frame)
+            hash_frames[name] = normalized
+            interval_frames[name] = normalized
+        hash_frames[f"{pair}:alt:funding"] = _pairs_frame(market.alt_funding)
+        hash_frames[f"{pair}:btc:funding"] = _pairs_frame(market.btc_funding)
+    return hash_frames, interval_frames
+
+
+def _common_history_bounds(
+    interval_frames: dict[str, pd.DataFrame],
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    starts = []
+    ends = []
+    for name, frame in interval_frames.items():
+        if frame.empty:
+            raise ValueError(f"empty market history: {name}")
+        interval = pd.Timedelta(hours=1) if name.endswith(":1h") else pd.Timedelta(minutes=15)
+        starts.append(_utc_timestamp(frame["ts"].min()))
+        ends.append(_utc_timestamp(frame["ts"].max()) + interval)
+    common_start = max(starts).ceil("1h")
+    common_end = min(ends).floor("1h")
+    if common_end <= common_start:
+        raise ValueError("insufficient common history: 0 days; need at least 360")
+    return common_start, common_end
+
+
+def _run_pairs_windows(
+    data: dict[str, PairMarketData], *, windows: list[WalkForwardWindow],
+    config: PairsBacktestConfig, params: pairs_engine.PairsParams,
+) -> tuple[list[PairTrade], list[str]]:
+    trades = []
+    invalid_reasons = []
+    for window in windows:
+        results = run_pairs_backtest(
+            data,
+            window_start=window.start,
+            window_end=window.end,
+            config=config,
+            params=params,
+        )
+        for pair in pairs_engine.FIXED_PAIRS:
+            result = results[pair]
+            trades.extend(result.trades)
+            invalid_reasons.extend(result.invalid_reasons)
+    return trades, list(dict.fromkeys(invalid_reasons))
+
+
+def _trial_record(
+    *, phase: str, trial_id: str, recorded_at: str,
+    params: pairs_engine.PairsParams, config: PairsBacktestConfig,
+    dataset_hashes: dict[str, str], schedule: WalkForwardSchedule,
+    metrics: dict[str, object], gate: GateDecision, invalid_reasons: list[str],
+    cost_stress: dict[str, dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "trial_id": trial_id,
+        "recorded_at": recorded_at,
+        "phase": phase,
+        "params": asdict(params),
+        "cost_config": asdict(config),
+        "dataset_hashes": dataset_hashes,
+        "dataset_hash": dataset_hashes["all"],
+        "common_start": schedule.common_start.isoformat(),
+        "common_end": schedule.common_end.isoformat(),
+        "metrics": metrics,
+        "cost_stress": cost_stress,
+        "gate": asdict(gate),
+        "invalid_reasons": invalid_reasons,
+    }
+
+
+def _schedule_report(schedule: WalkForwardSchedule) -> dict[str, object]:
+    return {
+        "common_start": schedule.common_start.isoformat(),
+        "common_end": schedule.common_end.isoformat(),
+        "holdout_start": schedule.holdout_start.isoformat(),
+        "development_windows": [
+            {
+                "formation_start": window.formation_start.isoformat(),
+                "start": window.start.isoformat(),
+                "end": window.end.isoformat(),
+            }
+            for window in schedule.development_windows
+        ],
+    }
+
+
+def run_pairs_experiment(
+    data: dict[str, PairMarketData], *, config: PairsBacktestConfig,
+    params: pairs_engine.PairsParams, open_holdout: bool,
+    ledger_path: Path,
+) -> dict[str, object]:
+    """Run development validation and, at most once, the sealed holdout."""
+    ledger_path = Path(ledger_path)
+    initial_ledger = _read_trial_ledger(ledger_path)
+    if open_holdout and initial_ledger["holdout"].get("status") != "sealed":
+        raise ValueError("holdout already opened")
+    historical_trial_count = len(initial_ledger["trials"])
+
+    hash_frames, interval_frames = _research_frames(data)
+    common_start, common_end = _common_history_bounds(interval_frames)
+    schedule = build_walk_forward_schedule(common_start, common_end)
+    dataset_hashes = {
+        name: dataset_hash({name: frame}) for name, frame in sorted(hash_frames.items())
+    }
+    dataset_hashes["all"] = dataset_hash(hash_frames)
+
+    nominal_config = replace(config, fee_bps=10.0, slippage_bps=2.0)
+    development_trades, development_invalid = _run_pairs_windows(
+        data,
+        windows=schedule.development_windows,
+        config=nominal_config,
+        params=params,
+    )
+    development_trial_count = historical_trial_count + 1
+    development_metrics = summarize_pair_trades(
+        development_trades, trial_count=development_trial_count,
+    )
+    development_cost_stress = _cost_stress_metrics(
+        development_trades,
+        base_config=nominal_config,
+        trial_count=development_trial_count,
+    )
+    development_metrics["cost_stress"] = development_cost_stress
+    development_metrics["invalid_reasons"] = development_invalid
+    development_decision = development_gate(development_metrics)
+    development_trial_id = uuid.uuid4().hex
+    development_recorded_at = datetime.now(timezone.utc).isoformat()
+    development_trial = _trial_record(
+        phase="development",
+        trial_id=development_trial_id,
+        recorded_at=development_recorded_at,
+        params=params,
+        config=nominal_config,
+        dataset_hashes=dataset_hashes,
+        schedule=schedule,
+        metrics=development_metrics,
+        gate=development_decision,
+        invalid_reasons=development_invalid,
+        cost_stress=development_cost_stress,
+    )
+    write_trial_ledger(ledger_path, development_trial)
+
+    report = {
+        "schedule": _schedule_report(schedule),
+        "dataset_hashes": dataset_hashes,
+        "development": {
+            "metrics": development_metrics,
+            "cost_stress": development_cost_stress,
+            "gate": asdict(development_decision),
+            "invalid_reasons": development_invalid,
+            "trial_id": development_trial_id,
+        },
+        "holdout": {
+            "requested": bool(open_holdout),
+            "opened": False,
+            "status": "sealed",
+        },
+    }
+    if not open_holdout or not development_decision.passed:
+        return _json_safe(report)
+
+    holdout_trial_id = uuid.uuid4().hex
+    holdout_recorded_at = datetime.now(timezone.utc).isoformat()
+    _reserve_holdout(
+        ledger_path,
+        dataset_digest=dataset_hashes["all"],
+        trial_id=holdout_trial_id,
+        opened_at=holdout_recorded_at,
+    )
+    holdout_window = WalkForwardWindow(
+        formation_start=schedule.holdout_start - pd.Timedelta(days=60),
+        start=schedule.holdout_start,
+        end=schedule.common_end,
+    )
+    holdout_trades, holdout_invalid = _run_pairs_windows(
+        data,
+        windows=[holdout_window],
+        config=nominal_config,
+        params=params,
+    )
+    combined_trades = development_trades + holdout_trades
+    combined_invalid = list(dict.fromkeys(development_invalid + holdout_invalid))
+    hard_trial_count = historical_trial_count + 2
+    hard_metrics = summarize_pair_trades(combined_trades, trial_count=hard_trial_count)
+    hard_cost_stress = _cost_stress_metrics(
+        combined_trades,
+        base_config=nominal_config,
+        trial_count=hard_trial_count,
+    )
+    hard_metrics["cost_stress"] = hard_cost_stress
+    hard_metrics["invalid_reasons"] = combined_invalid
+    hard_decision = hard_pass_gate(hard_metrics)
+    holdout_trial = _trial_record(
+        phase="holdout",
+        trial_id=holdout_trial_id,
+        recorded_at=holdout_recorded_at,
+        params=params,
+        config=nominal_config,
+        dataset_hashes=dataset_hashes,
+        schedule=schedule,
+        metrics=hard_metrics,
+        gate=hard_decision,
+        invalid_reasons=combined_invalid,
+        cost_stress=hard_cost_stress,
+    )
+    write_trial_ledger(ledger_path, holdout_trial)
+    report["holdout"] = {
+        "requested": True,
+        "opened": True,
+        "status": "opened",
+        "trial_id": holdout_trial_id,
+        "metrics": hard_metrics,
+        "cost_stress": hard_cost_stress,
+        "gate": asdict(hard_decision),
+        "invalid_reasons": combined_invalid,
+    }
+    return _json_safe(report)
 
 
 def run_backtest(
