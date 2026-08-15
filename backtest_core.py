@@ -915,7 +915,7 @@ _PAIR_EXIT_REASONS = (
 _COST_STRESS_GRID = tuple(
     (fee_bps, slippage_bps)
     for fee_bps in (5.0, 10.0, 15.0)
-    for slippage_bps in (1.0, 2.0, 5.0)
+    for slippage_bps in (0.0, 2.0, 5.0)
 )
 _LEDGER_SCHEMA = {
     "schema_version": 1,

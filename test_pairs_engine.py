@@ -1777,6 +1777,26 @@ def test_cost_stress_reprices_the_same_entry_exit_ledger():
     assert all(repriced_trade.net_return < original.net_return for repriced_trade, original in zip(repriced, trades))
 
 
+def test_cost_stress_grid_is_exactly_zero_two_five_by_five_ten_fifteen():
+    stress = bc._cost_stress_metrics(
+        [],
+        base_config=BASE_CONFIG,
+        trial_count=1,
+    )
+
+    assert set(stress) == {
+        "5bps_fee_0bps_slippage",
+        "5bps_fee_2bps_slippage",
+        "5bps_fee_5bps_slippage",
+        "10bps_fee_0bps_slippage",
+        "10bps_fee_2bps_slippage",
+        "10bps_fee_5bps_slippage",
+        "15bps_fee_0bps_slippage",
+        "15bps_fee_2bps_slippage",
+        "15bps_fee_5bps_slippage",
+    }
+
+
 def test_dataset_hash_is_order_stable_and_value_sensitive():
     left = pd.DataFrame({"ts": [TS0, TS1], "close": [100.0, 101.0]})
     right = pd.DataFrame({"ts": [TS0, TS1], "close": [50.0, 51.0]})
