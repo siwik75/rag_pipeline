@@ -5496,6 +5496,1368 @@
       "phase": "development",
       "recorded_at": "2026-08-15T12:08:24.403532+00:00",
       "trial_id": "f538bcced93b4160a97ea7d40594e2a0"
+    },
+    {
+      "common_end": "2026-08-15T12:00:00+00:00",
+      "common_start": "2024-12-23T13:00:00+00:00",
+      "cost_config": {
+        "fee_bps": 10.0,
+        "initial_equity": 10000.0,
+        "one_leg_execution_shock_bps": 0.0,
+        "risk_pct": 1.0,
+        "slippage_bps": 2.0
+      },
+      "cost_stress": {
+        "10bps_fee_0bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.005267805220866372,
+            0.003724132152127317
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.1317492628462663,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 895.3567977103055,
+          "gross_profit": 600.0386976803309,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.05157323131106182,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0012431846093758294,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0027089915940842696,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 428.4418804656672,
+              "gross_profit_contribution": 0.7140237490047994,
+              "mean_net_return": -0.0012906296834452348,
+              "median_net_return": -0.0023685727983028546,
+              "profit_factor": 0.7118114267021061
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 171.59681721466364,
+              "gross_profit_contribution": 0.2859762509952007,
+              "mean_net_return": -0.0011660863640130454,
+              "median_net_return": -0.0034994509130551617,
+              "profit_factor": 0.5847502605460739
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.6701671324937822,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0020000000000000005,
+              "sum": -0.04200000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            }
+          },
+          "sharpe": -0.6421136279496091,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.026106876796892418,
+          "total_pnl": -295.31810002997446,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "10bps_fee_2bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.00566607594608306,
+            0.003322963444925416
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.09631166962194204,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 941.1028262425191,
+          "gross_profit": 567.9031315861715,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.05483985727435191,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0016424745024531163,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0031089765682781895,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 405.16590555239327,
+              "gross_profit_contribution": 0.7134419287682955,
+              "mean_net_return": -0.0016893450223486159,
+              "median_net_return": -0.002768856399915527,
+              "profit_factor": 0.6442371044059819
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 162.73722603377814,
+              "gross_profit_contribution": 0.28655807123170446,
+              "mean_net_return": -0.0015663099076229294,
+              "median_net_return": -0.0038970839301421248,
+              "profit_factor": 0.5212682659830605
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.603444295086863,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0020000000000000005,
+              "sum": -0.04200000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0003992898930772868,
+              "sum": -0.008385087754623023
+            }
+          },
+          "sharpe": -0.8485226373597774,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.034491964551515444,
+          "total_pnl": -373.19969465634784,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "10bps_fee_5bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.006263482033908092,
+            0.002721210384122565
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.057924344995907116,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 1009.7218690408401,
+          "gross_profit": 519.6997824449323,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.059721080160860494,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0022414093420690465,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.003708954029569069,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 370.2519431824824,
+              "gross_profit_contribution": 0.7124342855035051,
+              "mean_net_return": -0.0022874180307036873,
+              "median_net_return": -0.003369281802334536,
+              "profit_factor": 0.5530980172561051
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 149.44783926244992,
+              "gross_profit_contribution": 0.2875657144964949,
+              "mean_net_return": -0.002166645223037755,
+              "median_net_return": -0.004493533455772569,
+              "profit_factor": 0.4391557180433272
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.5146959755745492,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0020000000000000005,
+              "sum": -0.04200000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0009982247326932171,
+              "sum": -0.02096271938655756
+            }
+          },
+          "sharpe": -1.1582918998764458,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.047069596183449976,
+          "total_pnl": -490.0220865959077,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "15bps_fee_0bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.00626780522086637,
+            0.0027241321521273166
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.05793754450337951,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 1009.9546119636004,
+          "gross_profit": 519.6068084894039,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.059774954803638126,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.002243184609375829,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0037089915940842696,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 370.38882248066125,
+              "gross_profit_contribution": 0.7128251909505424,
+              "mean_net_return": -0.002290629683445234,
+              "median_net_return": -0.0033685727983028546,
+              "profit_factor": 0.5528380595688906
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 149.21798600874268,
+              "gross_profit_contribution": 0.2871748090494577,
+              "mean_net_return": -0.002166086364013045,
+              "median_net_return": -0.004499450913055161,
+              "profit_factor": 0.4389054184846239
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.5144853068982579,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0030000000000000005,
+              "sum": -0.06300000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            }
+          },
+          "sharpe": -1.158620688209949,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.04710687679689241,
+          "total_pnl": -490.34780347419667,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "15bps_fee_2bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.006666075946083059,
+            0.002322963444925416
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.040348058688368896,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 1055.7006404958145,
+          "gross_profit": 487.4712423952445,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.06301650096307428,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0026424745024531157,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0041089765682781896,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 347.11284756738735,
+              "gross_profit_contribution": 0.7120683588673037,
+              "mean_net_return": -0.0026893450223486157,
+              "median_net_return": -0.003768856399915527,
+              "profit_factor": 0.4980230451633166
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 140.35839482785718,
+              "gross_profit_contribution": 0.28793164113269637,
+              "mean_net_return": -0.002566309907622929,
+              "median_net_return": -0.004897083930142125,
+              "profit_factor": 0.39127656658372545
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.4617513939996299,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0030000000000000005,
+              "sum": -0.06300000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0003992898930772868,
+              "sum": -0.008385087754623023
+            }
+          },
+          "sharpe": -1.365135002478668,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.05549196455151543,
+          "total_pnl": -568.2293981005699,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "15bps_fee_5bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.007263482033908093,
+            0.0017212103841225646
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.022741087227927774,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 1125.9357348191402,
+          "gross_profit": 440.88394477901033,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.06982303930512418,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0032414093420690465,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.004708954029569069,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 313.8149367224814,
+              "gross_profit_contribution": 0.711785812204567,
+              "mean_net_return": -0.0032874180307036877,
+              "median_net_return": -0.0043692818023345365,
+              "profit_factor": 0.42458822501570354
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 127.06900805652896,
+              "gross_profit_contribution": 0.2882141877954329,
+              "mean_net_return": -0.003166645223037755,
+              "median_net_return": -0.005493533455772569,
+              "profit_factor": 0.32848667647154167
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.39157114491070827,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0030000000000000005,
+              "sum": -0.06300000000000001
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0009982247326932171,
+              "sum": -0.02096271938655756
+            }
+          },
+          "sharpe": -1.675061361900382,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.06806959618344997,
+          "total_pnl": -685.0517900401298,
+          "trial_count": 2,
+          "win_rate": 0.38095238095238093,
+          "wins": 8
+        },
+        "5bps_fee_0bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.004267805220866371,
+            0.004724132152127316
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.261257092567313,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 780.7589834570102,
+          "gross_profit": 680.4705868712576,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.043308099747031786,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.00024318460937582977,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0017089915940842696,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 486.49493845067315,
+              "gross_profit_contribution": 0.7149389669986074,
+              "mean_net_return": -0.00029062968344523523,
+              "median_net_return": -0.0013685727983028544,
+              "profit_factor": 0.9113290126340475
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 193.9756484205846,
+              "gross_profit_contribution": 0.2850610330013926,
+              "mean_net_return": -0.00016608636401304559,
+              "median_net_return": -0.0024994509130551613,
+              "profit_factor": 0.7855529701413672
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.8715501214706489,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0010000000000000002,
+              "sum": -0.021000000000000005
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            }
+          },
+          "sharpe": -0.12560656768926903,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.005106876796892425,
+          "total_pnl": -100.28839658575234,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "5bps_fee_2bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.0046660759460830595,
+            0.004322963444925415
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.2023029416935469,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 826.5050119892239,
+          "gross_profit": 648.3350207770983,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.04659997477086923,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0006424745024531163,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.0021089765682781895,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 463.2189635373992,
+              "gross_profit_contribution": 0.7144746908506995,
+              "mean_net_return": -0.0006893450223486167,
+              "median_net_return": -0.001768856399915527,
+              "profit_factor": 0.8259457415432332
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 185.11605723969916,
+              "gross_profit_contribution": 0.28552530914930047,
+              "mean_net_return": -0.0005663099076229296,
+              "median_net_return": -0.0028970839301421247,
+              "profit_factor": 0.6967884290476855
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.7844296300353849,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0010000000000000002,
+              "sum": -0.021000000000000005
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0003992898930772868,
+              "sum": -0.008385087754623023
+            }
+          },
+          "sharpe": -0.33191027224088687,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.013491964551515443,
+          "total_pnl": -178.16999121212564,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        },
+        "5bps_fee_5bps_slippage": {
+          "absolute_realized_btc_beta": 0.1086498592465394,
+          "bootstrap_block_length": 5,
+          "bootstrap_mean_net_return_ci_95": [
+            -0.005263482033908092,
+            0.0037212103841225645
+          ],
+          "bootstrap_resamples": 2000,
+          "completed_trades": 21,
+          "deflated_sharpe_probability": 0.13183167315502164,
+          "exit_counts": {
+            "convergence": 7,
+            "data_gap": 0,
+            "divergence_stop": 3,
+            "structural": 8,
+            "time_stop": 2,
+            "window_boundary": 1
+          },
+          "exposure": 0.051835317460317464,
+          "forced_closes": 1,
+          "funding_events": 134,
+          "gross_loss": 895.1240547875449,
+          "gross_profit": 600.1316716358591,
+          "long_alt_fraction": 0.5714285714285714,
+          "long_alt_trades": 12,
+          "max_drawdown": 0.0515189449567163,
+          "mean_holding_hours": 24.88095238095238,
+          "mean_mae_return": -0.004953473811995917,
+          "mean_mae_z": -0.6316980359695488,
+          "mean_mfe_return": 0.005797739676674815,
+          "mean_mfe_z": 1.0354531075322326,
+          "mean_net_return": -0.0012414093420690467,
+          "median_holding_hours": 11.75,
+          "median_mae_return": -0.003703433803357385,
+          "median_mae_z": -0.44008201947607484,
+          "median_mfe_return": 0.004173149187062785,
+          "median_mfe_z": 1.0189746215162636,
+          "median_net_return": -0.002708954029569069,
+          "per_pair": {
+            "ETHUSDT/BTCUSDT": {
+              "completed_trades": 13,
+              "gross_profit": 428.30500116748834,
+              "gross_profit_contribution": 0.7136850484827773,
+              "mean_net_return": -0.001287418030703687,
+              "median_net_return": -0.0023692818023345356,
+              "profit_factor": 0.7122494826833716
+            },
+            "SOLUSDT/BTCUSDT": {
+              "completed_trades": 8,
+              "gross_profit": 171.8266704683709,
+              "gross_profit_contribution": 0.2863149515172228,
+              "mean_net_return": -0.0011666452230377554,
+              "median_net_return": -0.003493533455772569,
+              "profit_factor": 0.5848765597107211
+            }
+          },
+          "per_pair_trades": {
+            "ETHUSDT/BTCUSDT": 13,
+            "SOLUSDT/BTCUSDT": 8
+          },
+          "profit_factor": 0.6704452510532729,
+          "return_components": {
+            "execution_shock_return": {
+              "mean": 0.0,
+              "sum": 0.0
+            },
+            "fee_return": {
+              "mean": -0.0010000000000000002,
+              "sum": -0.021000000000000005
+            },
+            "funding_return": {
+              "mean": 3.6361751827449885e-05,
+              "sum": 0.0007635967883764475
+            },
+            "price_return": {
+              "mean": 0.0007204536387967209,
+              "sum": 0.015129526414731139
+            },
+            "slippage_return": {
+              "mean": -0.0009982247326932171,
+              "sum": -0.02096271938655756
+            }
+          },
+          "sharpe": -0.6415224378525097,
+          "short_alt_fraction": 0.42857142857142855,
+          "short_alt_trades": 9,
+          "total_holding_hours": 522.5,
+          "total_net_return": -0.026069596183449978,
+          "total_pnl": -294.99238315168566,
+          "trial_count": 2,
+          "win_rate": 0.42857142857142855,
+          "wins": 9
+        }
+      },
+      "dataset_hashes": {
+        "BTCUSDT:15m": "115309c879c9ebbc2dc39456bff63570bf56749db483f22390b5a9151a0e6e34",
+        "BTCUSDT:1h": "09047927ac0360ff917b87dd7ac33be0217b8a2abbe799ce50cf62570af9ff66",
+        "BTCUSDT:funding": "38e02782a8427409d41f5e10fc1362f48d4c7e15b91d9e27a6b9ba1997d6c0ee",
+        "ETHUSDT:15m": "a24a60e3bb51a01b9249a9129fc0d1c172ea7e1d0140234bc8ade80daff8cc35",
+        "ETHUSDT:1h": "1c0f0e5b07025fd478864e0b4de64297e7d086fbff52f5225b53566b3e4a04ea",
+        "ETHUSDT:funding": "5ccb6b02e1462243f6b2be4e9d14ce4afb18538ee40ccef7dfe207c92b773212",
+        "SOLUSDT:15m": "239b0bf5f62267ecdeaa918a63c1edc42d4c50da67eb6ed34d106fed4fb6ddc2",
+        "SOLUSDT:1h": "679cd438f37a2e7ec0b016ec96ba0dc208805f5896db5fb6c802dc9a0272e1db",
+        "SOLUSDT:funding": "9ff551e1e7eae7441eb7e8b8ce8bc2ade5d2c95c862e8548a509373d626cf3b2",
+        "all": "d0b23ad0c99a2bfdfa6a9d471ae6c08d3fe7ce30abaf8a5edb2c3f07d6aa81fe"
+      },
+      "gate": {
+        "failed_conditions": [
+          "completed_trades",
+          "per_pair_trades",
+          "profit_factor",
+          "win_rate",
+          "per_pair_mean_net_return"
+        ],
+        "passed": false
+      },
+      "invalid_reasons": [],
+      "metrics": {
+        "absolute_realized_btc_beta": 0.1086498592465394,
+        "bootstrap_block_length": 5,
+        "bootstrap_mean_net_return_ci_95": [
+          -0.00566607594608306,
+          0.003322963444925416
+        ],
+        "bootstrap_resamples": 2000,
+        "completed_trades": 21,
+        "deflated_sharpe_probability": 0.09631166962194204,
+        "exit_counts": {
+          "convergence": 7,
+          "data_gap": 0,
+          "divergence_stop": 3,
+          "structural": 8,
+          "time_stop": 2,
+          "window_boundary": 1
+        },
+        "exposure": 0.051835317460317464,
+        "forced_closes": 1,
+        "funding_events": 134,
+        "gross_loss": 941.1028262425191,
+        "gross_profit": 567.9031315861715,
+        "invalid_reasons": [],
+        "leave_one_pair_out": {
+          "ETHUSDT/BTCUSDT": {
+            "absolute_realized_btc_beta": 0.11217334565253952,
+            "bootstrap_block_length": 3,
+            "bootstrap_mean_net_return_ci_95": [
+              -0.0073914614268653,
+              0.004013909944234034
+            ],
+            "bootstrap_resamples": 2000,
+            "completed_trades": 8,
+            "deflated_sharpe_probability": 0.15109739676165995,
+            "exit_counts": {
+              "convergence": 3,
+              "data_gap": 0,
+              "divergence_stop": 0,
+              "structural": 5,
+              "time_stop": 0,
+              "window_boundary": 0
+            },
+            "exposure": 0.018278769841269842,
+            "forced_closes": 0,
+            "funding_events": 48,
+            "gross_loss": 312.1947692842414,
+            "gross_profit": 162.73722603377814,
+            "long_alt_fraction": 0.375,
+            "long_alt_trades": 3,
+            "max_drawdown": 0.03098247740367675,
+            "mean_holding_hours": 23.03125,
+            "mean_mae_return": -0.0054764235052322825,
+            "mean_mae_z": -0.5882763422103536,
+            "mean_mfe_return": 0.0059534355671421076,
+            "mean_mfe_z": 0.9697997617488271,
+            "mean_net_return": -0.0015663099076229294,
+            "median_holding_hours": 15.625,
+            "median_mae_return": -0.0038727239349844443,
+            "median_mae_z": -0.4456518126426654,
+            "median_mfe_return": 0.005162235838042984,
+            "median_mfe_z": 0.9467819861137142,
+            "median_net_return": -0.0038970839301421248,
+            "per_pair": {
+              "ETHUSDT/BTCUSDT": {
+                "completed_trades": 0,
+                "gross_profit": 0.0,
+                "gross_profit_contribution": 0.0,
+                "mean_net_return": 0.0,
+                "median_net_return": 0.0,
+                "profit_factor": 0.0
+              },
+              "SOLUSDT/BTCUSDT": {
+                "completed_trades": 8,
+                "gross_profit": 162.73722603377814,
+                "gross_profit_contribution": 1.0,
+                "mean_net_return": -0.0015663099076229294,
+                "median_net_return": -0.0038970839301421248,
+                "profit_factor": 0.5212682659830605
+              }
+            },
+            "per_pair_trades": {
+              "ETHUSDT/BTCUSDT": 0,
+              "SOLUSDT/BTCUSDT": 8
+            },
+            "profit_factor": 0.5212682659830605,
+            "return_components": {
+              "execution_shock_return": {
+                "mean": 0.0,
+                "sum": 0.0
+              },
+              "fee_return": {
+                "mean": -0.002,
+                "sum": -0.016
+              },
+              "funding_return": {
+                "mean": -1.1869053000191503e-05,
+                "sum": -9.495242400153203e-05
+              },
+              "price_return": {
+                "mean": 0.0008457826889871458,
+                "sum": 0.006766261511897166
+              },
+              "slippage_return": {
+                "mean": -0.0004002235436098839,
+                "sum": -0.003201788348879071
+              }
+            },
+            "sharpe": -0.568788867704095,
+            "short_alt_fraction": 0.625,
+            "short_alt_trades": 5,
+            "total_holding_hours": 184.25,
+            "total_net_return": -0.012530479260983435,
+            "total_pnl": -149.45754325046326,
+            "trial_count": 2,
+            "win_rate": 0.375,
+            "wins": 3
+          },
+          "SOLUSDT/BTCUSDT": {
+            "absolute_realized_btc_beta": 0.10687506924258594,
+            "bootstrap_block_length": 4,
+            "bootstrap_mean_net_return_ci_95": [
+              -0.00860406062556303,
+              0.004041006408498738
+            ],
+            "bootstrap_resamples": 2000,
+            "completed_trades": 13,
+            "deflated_sharpe_probability": 0.14019501778922228,
+            "exit_counts": {
+              "convergence": 4,
+              "data_gap": 0,
+              "divergence_stop": 3,
+              "structural": 3,
+              "time_stop": 2,
+              "window_boundary": 1
+            },
+            "exposure": 0.03355654761904762,
+            "forced_closes": 1,
+            "funding_events": 86,
+            "gross_loss": 628.9080569582778,
+            "gross_profit": 405.16590555239327,
+            "long_alt_fraction": 0.6923076923076923,
+            "long_alt_trades": 9,
+            "max_drawdown": 0.05925927975813488,
+            "mean_holding_hours": 26.01923076923077,
+            "mean_mae_return": -0.004631658616158153,
+            "mean_mae_z": -0.6584190782828998,
+            "mean_mfe_return": 0.005701926821002636,
+            "mean_mfe_z": 1.0758551664758669,
+            "mean_net_return": -0.0016893450223486159,
+            "median_holding_hours": 9.5,
+            "median_mae_return": -0.0030672515644234117,
+            "median_mae_z": -0.44008201947607484,
+            "median_mfe_return": 0.0032318206663816233,
+            "median_mfe_z": 1.0189746215162636,
+            "median_net_return": -0.002768856399915527,
+            "per_pair": {
+              "ETHUSDT/BTCUSDT": {
+                "completed_trades": 13,
+                "gross_profit": 405.16590555239327,
+                "gross_profit_contribution": 1.0,
+                "mean_net_return": -0.0016893450223486159,
+                "median_net_return": -0.002768856399915527,
+                "profit_factor": 0.6442371044059819
+              },
+              "SOLUSDT/BTCUSDT": {
+                "completed_trades": 0,
+                "gross_profit": 0.0,
+                "gross_profit_contribution": 0.0,
+                "mean_net_return": 0.0,
+                "median_net_return": 0.0,
+                "profit_factor": 0.0
+              }
+            },
+            "per_pair_trades": {
+              "ETHUSDT/BTCUSDT": 13,
+              "SOLUSDT/BTCUSDT": 0
+            },
+            "profit_factor": 0.6442371044059819,
+            "return_components": {
+              "execution_shock_return": {
+                "mean": 0.0,
+                "sum": 0.0
+              },
+              "fee_return": {
+                "mean": -0.002000000000000001,
+                "sum": -0.02600000000000001
+              },
+              "funding_return": {
+                "mean": 6.604224710599844e-05,
+                "sum": 0.0008585492123779797
+              },
+              "price_return": {
+                "mean": 0.0006433280694487666,
+                "sum": 0.008363264902833966
+              },
+              "slippage_return": {
+                "mean": -0.00039871533890338095,
+                "sum": -0.005183299405743952
+              }
+            },
+            "sharpe": -0.6224848245524914,
+            "short_alt_fraction": 0.3076923076923077,
+            "short_alt_trades": 4,
+            "total_holding_hours": 338.25,
+            "total_net_return": -0.021961485290532008,
+            "total_pnl": -223.7421514058845,
+            "trial_count": 2,
+            "win_rate": 0.46153846153846156,
+            "wins": 6
+          }
+        },
+        "long_alt_fraction": 0.5714285714285714,
+        "long_alt_trades": 12,
+        "max_drawdown": 0.05483985727435191,
+        "mean_holding_hours": 24.88095238095238,
+        "mean_mae_return": -0.004953473811995917,
+        "mean_mae_z": -0.6316980359695488,
+        "mean_mfe_return": 0.005797739676674815,
+        "mean_mfe_z": 1.0354531075322326,
+        "mean_net_return": -0.0016424745024531163,
+        "median_holding_hours": 11.75,
+        "median_mae_return": -0.003703433803357385,
+        "median_mae_z": -0.44008201947607484,
+        "median_mfe_return": 0.004173149187062785,
+        "median_mfe_z": 1.0189746215162636,
+        "median_net_return": -0.0031089765682781895,
+        "per_pair": {
+          "ETHUSDT/BTCUSDT": {
+            "completed_trades": 13,
+            "gross_profit": 405.16590555239327,
+            "gross_profit_contribution": 0.7134419287682955,
+            "mean_net_return": -0.0016893450223486159,
+            "median_net_return": -0.002768856399915527,
+            "profit_factor": 0.6442371044059819
+          },
+          "SOLUSDT/BTCUSDT": {
+            "completed_trades": 8,
+            "gross_profit": 162.73722603377814,
+            "gross_profit_contribution": 0.28655807123170446,
+            "mean_net_return": -0.0015663099076229294,
+            "median_net_return": -0.0038970839301421248,
+            "profit_factor": 0.5212682659830605
+          }
+        },
+        "per_pair_diagnostics": {
+          "ETHUSDT/BTCUSDT": {
+            "absolute_realized_btc_beta": 0.10687506924258594,
+            "bootstrap_block_length": 4,
+            "bootstrap_mean_net_return_ci_95": [
+              -0.00860406062556303,
+              0.004041006408498738
+            ],
+            "bootstrap_resamples": 2000,
+            "completed_trades": 13,
+            "deflated_sharpe_probability": 0.14019501778922228,
+            "exit_counts": {
+              "convergence": 4,
+              "data_gap": 0,
+              "divergence_stop": 3,
+              "structural": 3,
+              "time_stop": 2,
+              "window_boundary": 1
+            },
+            "exposure": 0.03355654761904762,
+            "forced_closes": 1,
+            "funding_events": 86,
+            "gross_loss": 628.9080569582778,
+            "gross_profit": 405.16590555239327,
+            "long_alt_fraction": 0.6923076923076923,
+            "long_alt_trades": 9,
+            "max_drawdown": 0.05925927975813488,
+            "mean_holding_hours": 26.01923076923077,
+            "mean_mae_return": -0.004631658616158153,
+            "mean_mae_z": -0.6584190782828998,
+            "mean_mfe_return": 0.005701926821002636,
+            "mean_mfe_z": 1.0758551664758669,
+            "mean_net_return": -0.0016893450223486159,
+            "median_holding_hours": 9.5,
+            "median_mae_return": -0.0030672515644234117,
+            "median_mae_z": -0.44008201947607484,
+            "median_mfe_return": 0.0032318206663816233,
+            "median_mfe_z": 1.0189746215162636,
+            "median_net_return": -0.002768856399915527,
+            "per_pair": {
+              "ETHUSDT/BTCUSDT": {
+                "completed_trades": 13,
+                "gross_profit": 405.16590555239327,
+                "gross_profit_contribution": 1.0,
+                "mean_net_return": -0.0016893450223486159,
+                "median_net_return": -0.002768856399915527,
+                "profit_factor": 0.6442371044059819
+              },
+              "SOLUSDT/BTCUSDT": {
+                "completed_trades": 0,
+                "gross_profit": 0.0,
+                "gross_profit_contribution": 0.0,
+                "mean_net_return": 0.0,
+                "median_net_return": 0.0,
+                "profit_factor": 0.0
+              }
+            },
+            "per_pair_trades": {
+              "ETHUSDT/BTCUSDT": 13,
+              "SOLUSDT/BTCUSDT": 0
+            },
+            "profit_factor": 0.6442371044059819,
+            "return_components": {
+              "execution_shock_return": {
+                "mean": 0.0,
+                "sum": 0.0
+              },
+              "fee_return": {
+                "mean": -0.002000000000000001,
+                "sum": -0.02600000000000001
+              },
+              "funding_return": {
+                "mean": 6.604224710599844e-05,
+                "sum": 0.0008585492123779797
+              },
+              "price_return": {
+                "mean": 0.0006433280694487666,
+                "sum": 0.008363264902833966
+              },
+              "slippage_return": {
+                "mean": -0.00039871533890338095,
+                "sum": -0.005183299405743952
+              }
+            },
+            "sharpe": -0.6224848245524914,
+            "short_alt_fraction": 0.3076923076923077,
+            "short_alt_trades": 4,
+            "total_holding_hours": 338.25,
+            "total_net_return": -0.021961485290532008,
+            "total_pnl": -223.7421514058845,
+            "trial_count": 2,
+            "win_rate": 0.46153846153846156,
+            "wins": 6
+          },
+          "SOLUSDT/BTCUSDT": {
+            "absolute_realized_btc_beta": 0.11217334565253952,
+            "bootstrap_block_length": 3,
+            "bootstrap_mean_net_return_ci_95": [
+              -0.0073914614268653,
+              0.004013909944234034
+            ],
+            "bootstrap_resamples": 2000,
+            "completed_trades": 8,
+            "deflated_sharpe_probability": 0.15109739676165995,
+            "exit_counts": {
+              "convergence": 3,
+              "data_gap": 0,
+              "divergence_stop": 0,
+              "structural": 5,
+              "time_stop": 0,
+              "window_boundary": 0
+            },
+            "exposure": 0.018278769841269842,
+            "forced_closes": 0,
+            "funding_events": 48,
+            "gross_loss": 312.1947692842414,
+            "gross_profit": 162.73722603377814,
+            "long_alt_fraction": 0.375,
+            "long_alt_trades": 3,
+            "max_drawdown": 0.03098247740367675,
+            "mean_holding_hours": 23.03125,
+            "mean_mae_return": -0.0054764235052322825,
+            "mean_mae_z": -0.5882763422103536,
+            "mean_mfe_return": 0.0059534355671421076,
+            "mean_mfe_z": 0.9697997617488271,
+            "mean_net_return": -0.0015663099076229294,
+            "median_holding_hours": 15.625,
+            "median_mae_return": -0.0038727239349844443,
+            "median_mae_z": -0.4456518126426654,
+            "median_mfe_return": 0.005162235838042984,
+            "median_mfe_z": 0.9467819861137142,
+            "median_net_return": -0.0038970839301421248,
+            "per_pair": {
+              "ETHUSDT/BTCUSDT": {
+                "completed_trades": 0,
+                "gross_profit": 0.0,
+                "gross_profit_contribution": 0.0,
+                "mean_net_return": 0.0,
+                "median_net_return": 0.0,
+                "profit_factor": 0.0
+              },
+              "SOLUSDT/BTCUSDT": {
+                "completed_trades": 8,
+                "gross_profit": 162.73722603377814,
+                "gross_profit_contribution": 1.0,
+                "mean_net_return": -0.0015663099076229294,
+                "median_net_return": -0.0038970839301421248,
+                "profit_factor": 0.5212682659830605
+              }
+            },
+            "per_pair_trades": {
+              "ETHUSDT/BTCUSDT": 0,
+              "SOLUSDT/BTCUSDT": 8
+            },
+            "profit_factor": 0.5212682659830605,
+            "return_components": {
+              "execution_shock_return": {
+                "mean": 0.0,
+                "sum": 0.0
+              },
+              "fee_return": {
+                "mean": -0.002,
+                "sum": -0.016
+              },
+              "funding_return": {
+                "mean": -1.1869053000191503e-05,
+                "sum": -9.495242400153203e-05
+              },
+              "price_return": {
+                "mean": 0.0008457826889871458,
+                "sum": 0.006766261511897166
+              },
+              "slippage_return": {
+                "mean": -0.0004002235436098839,
+                "sum": -0.003201788348879071
+              }
+            },
+            "sharpe": -0.568788867704095,
+            "short_alt_fraction": 0.625,
+            "short_alt_trades": 5,
+            "total_holding_hours": 184.25,
+            "total_net_return": -0.012530479260983435,
+            "total_pnl": -149.45754325046326,
+            "trial_count": 2,
+            "win_rate": 0.375,
+            "wins": 3
+          }
+        },
+        "per_pair_trades": {
+          "ETHUSDT/BTCUSDT": 13,
+          "SOLUSDT/BTCUSDT": 8
+        },
+        "profit_factor": 0.603444295086863,
+        "return_components": {
+          "execution_shock_return": {
+            "mean": 0.0,
+            "sum": 0.0
+          },
+          "fee_return": {
+            "mean": -0.0020000000000000005,
+            "sum": -0.04200000000000001
+          },
+          "funding_return": {
+            "mean": 3.6361751827449885e-05,
+            "sum": 0.0007635967883764475
+          },
+          "price_return": {
+            "mean": 0.0007204536387967209,
+            "sum": 0.015129526414731139
+          },
+          "slippage_return": {
+            "mean": -0.0003992898930772868,
+            "sum": -0.008385087754623023
+          }
+        },
+        "sharpe": -0.8485226373597774,
+        "short_alt_fraction": 0.42857142857142855,
+        "short_alt_trades": 9,
+        "total_holding_hours": 522.5,
+        "total_net_return": -0.034491964551515444,
+        "total_pnl": -373.19969465634784,
+        "trial_count": 2,
+        "win_rate": 0.42857142857142855,
+        "wins": 9
+      },
+      "params": {
+        "confirm_reversion": 0.1,
+        "confirmation_bars": 4,
+        "convergence_z": 0.5,
+        "entry_z": 2.0,
+        "formation_hours": 1440,
+        "max_adf_pvalue": 0.05,
+        "max_beta_change": 0.3,
+        "max_half_life_hours": 72.0,
+        "max_holding_hours": 72,
+        "min_half_life_hours": 2.0,
+        "min_observations": 1200,
+        "min_return_correlation": 0.6,
+        "residual_history_hours": 720,
+        "stop_z": 3.5
+      },
+      "phase": "development",
+      "recorded_at": "2026-08-15T12:28:56.921044+00:00",
+      "trial_id": "883cd56ef4f5cb83241c539c0daa7796d1587d06655a5e1fd004656730518c91"
     }
   ]
 }

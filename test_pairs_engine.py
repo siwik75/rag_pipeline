@@ -3,6 +3,7 @@ import json
 import multiprocessing
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -669,6 +670,69 @@ def test_crossed_funding_is_leg_directional_and_not_asof_repeated():
         (-0.0001 * trade.alt_weight) + (0.0002 * trade.btc_weight)
     )
     assert trade.funding_events == 2
+
+
+def test_funding_boundary_is_strict_after_entry_and_inclusive_at_exit():
+    entry = pd.Timestamp("2024-01-01T08:00:00Z")
+    exit_ts = pd.Timestamp("2024-01-01T16:00:00Z")
+    funding = pd.DataFrame({
+        "ts": [entry, exit_ts],
+        "funding_rate": [0.50, 0.001],
+    })
+    position = {
+        "market": SimpleNamespace(
+            pair="ETHUSDT/BTCUSDT",
+            alt_funding=funding,
+            btc_funding=funding,
+        ),
+        "signal": SimpleNamespace(
+            alt_side="LONG", btc_side="SHORT", alt_weight=0.5, btc_weight=0.5,
+        ),
+        "entry_ts": entry,
+    }
+
+    funding_return, funding_events = bc._trade_funding(position, exit_ts, [])
+
+    assert funding_return == pytest.approx(0.0)
+    assert funding_events == 2
+
+
+@pytest.mark.parametrize("offset_ms", [1, 16])
+def test_pairs_funding_normalizes_subsecond_exchange_jitter(offset_ms):
+    nominal = pd.Timestamp("2026-01-21T08:00:00Z")
+    raw = pd.DataFrame({
+        "ts": [nominal + pd.Timedelta(milliseconds=offset_ms)],
+        "funding_rate": [0.0001],
+    })
+
+    normalized = bc.normalize_pairs_funding(raw, symbol="ETHUSDT")
+
+    assert normalized.to_dict("records") == [
+        {"ts": nominal, "funding_rate": 0.0001}
+    ]
+
+
+def test_pairs_funding_rejects_off_schedule_rows_outside_one_second():
+    raw = pd.DataFrame({
+        "ts": [pd.Timestamp("2026-01-21T08:00:01.001Z")],
+        "funding_rate": [0.0001],
+    })
+
+    with pytest.raises(ValueError, match="off-schedule funding timestamp.*ETHUSDT"):
+        bc.normalize_pairs_funding(raw, symbol="ETHUSDT")
+
+
+@pytest.mark.parametrize("rates", [[0.0001, 0.0001], [0.0001, 0.0002]])
+def test_pairs_funding_rejects_duplicate_or_conflicting_nominal_rows(rates):
+    nominal = pd.Timestamp("2026-01-21T08:00:00Z")
+    raw = pd.DataFrame({
+        "ts": [nominal + pd.Timedelta(milliseconds=1),
+               nominal + pd.Timedelta(milliseconds=16)],
+        "funding_rate": rates,
+    })
+
+    with pytest.raises(ValueError, match="duplicate funding boundary.*ETHUSDT"):
+        bc.normalize_pairs_funding(raw, symbol="ETHUSDT")
 
 
 @pytest.mark.usefixtures("replay_observations")
@@ -1672,6 +1736,8 @@ def test_trade_summary_bootstrap_is_seeded_and_trial_penalty_is_monotone():
         "data_gap",
         "window_boundary",
     }
+    assert set(first["per_pair_diagnostics"]) == set(pe.FIXED_PAIRS)
+    assert first["per_pair_diagnostics"]["ETHUSDT/BTCUSDT"]["completed_trades"] == 20
 
 
 def test_deflated_sharpe_and_drawdown_match_known_values():
@@ -1987,10 +2053,60 @@ def test_experiment_development_failure_keeps_holdout_sealed(tmp_path, monkeypat
     assert len(calls) == 7
     assert report["development"]["gate"]["passed"] is False
     assert report["holdout"] == {"requested": True, "opened": False, "status": "sealed"}
+    assert report["request_error"] == {
+        "code": "development_gate_failed",
+        "failed_conditions": report["development"]["gate"]["failed_conditions"],
+    }
     persisted = json.loads(ledger_path.read_text())
     assert persisted["holdout"]["status"] == "sealed"
-    assert len(persisted["trials"]) == 1
-    assert persisted["trials"][0]["gate"]["passed"] is False
+    assert persisted["trials"] == []
+
+
+def test_development_report_preserves_window_metrics_without_stress_duplication(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+
+    report = bc.run_pairs_experiment(
+        make_experiment_market_data(),
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "ledger.json",
+    )
+
+    windows = report["development"]["windows"]
+    assert len(windows) == len(report["schedule"]["development_windows"])
+    assert all(window["metrics"]["completed_trades"] == 10 for window in windows)
+    assert all(set(window["metrics"]["per_pair_diagnostics"]) == set(pe.FIXED_PAIRS)
+               for window in windows)
+    assert "cost_stress" not in report["development"]["metrics"]
+    assert "cost_stress" not in report["development"]
+    assert len(report["cost_stress"]) == 9
+
+
+def test_trial_id_is_deterministic_for_fixed_phase_params_costs_and_frames(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+    data = make_experiment_market_data()
+
+    first = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "first.json",
+    )
+    second = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "second.json",
+    )
+
+    assert first["development"]["trial_id"] == second["development"]["trial_id"]
 
 
 def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_path, monkeypatch):
