@@ -602,10 +602,12 @@ def _complete_pair_trade(
 
 
 def _observation_rows(
-    market: PairMarketData, params: pairs_engine.PairsParams,
+    market: PairMarketData, params: pairs_engine.PairsParams, *, universe,
 ) -> list[pairs_engine.PairObservation]:
     hourly = pairs_engine.align_hourly_prices(market.alt_1h, market.btc_1h)
-    frame = pairs_engine.build_hourly_observations(hourly, params, pair=market.pair)
+    frame = pairs_engine.build_hourly_observations(
+        hourly, params, pair=market.pair, universe=universe,
+    )
     observations = []
     for _, row in frame.iterrows():
         if row.get("pair") != market.pair:
@@ -675,8 +677,11 @@ def run_pairs_backtest(
     data: dict[str, PairMarketData], *, window_start: pd.Timestamp,
     window_end: pd.Timestamp, config: PairsBacktestConfig,
     params: pairs_engine.PairsParams = pairs_engine.DEFAULT_PARAMS,
+    universe=None,
 ) -> dict[str, PairsBacktestResult]:
-    """Replay the fixed BTC-relative pairs on one synchronized 15m clock."""
+    """Replay the BTC-relative pairs of ``universe`` on one synchronized 15m clock."""
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
     window_start = pd.Timestamp(window_start)
     window_end = pd.Timestamp(window_end)
     window_start = (
@@ -690,8 +695,8 @@ def run_pairs_backtest(
     if window_end <= window_start:
         raise ValueError("window_end must be after window_start")
 
-    ordered_pairs = [pair for pair in pairs_engine.FIXED_PAIRS if pair in data]
-    unknown_pairs = set(data) - set(pairs_engine.FIXED_PAIRS)
+    ordered_pairs = [pair for pair in universe if pair in data]
+    unknown_pairs = set(data) - set(universe)
     if unknown_pairs:
         raise ValueError(f"unsupported pairs: {sorted(unknown_pairs)}")
     if not ordered_pairs:
@@ -714,7 +719,7 @@ def run_pairs_backtest(
             "market": market,
             "alt_rows": alt_rows,
             "btc_rows": btc_rows,
-            "observations": _observation_rows(market, params),
+            "observations": _observation_rows(market, params, universe=universe),
             "observation_index": 0,
             "latest_observation": None,
             "pending_confirmation": None,
@@ -895,7 +900,7 @@ def run_pairs_backtest(
                 })
 
         if candidates:
-            pair_priority = {pair: index for index, pair in enumerate(pairs_engine.FIXED_PAIRS)}
+            pair_priority = {pair: index for index, pair in enumerate(universe)}
             candidates.sort(key=lambda candidate: (
                 -abs(candidate["entry_z"]), pair_priority[candidate["pair"]],
             ))
@@ -1114,7 +1119,10 @@ def _summarize_pair_trades(
     trades: list[PairTrade], *, trial_count: int,
     observation_duration: pd.Timedelta | None,
     include_leave_one_pair_out: bool,
+    universe=None,
 ) -> dict[str, object]:
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
     ordered = sorted(trades, key=lambda trade: (trade.exit_ts, trade.entry_ts, trade.pair))
     returns = np.asarray([trade.net_return for trade in ordered], dtype=float)
     pnls = np.asarray([trade.pnl for trade in ordered], dtype=float)
@@ -1171,7 +1179,7 @@ def _summarize_pair_trades(
 
     per_pair = {
         pair: _basic_pair_summary([trade for trade in ordered if trade.pair == pair])
-        for pair in pairs_engine.FIXED_PAIRS
+        for pair in universe
     }
     total_gross_profit = float(sum(summary["gross_profit"] for summary in per_pair.values()))
     for summary in per_pair.values():
@@ -1256,8 +1264,9 @@ def _summarize_pair_trades(
                 trial_count=trial_count,
                 observation_duration=observation_duration,
                 include_leave_one_pair_out=False,
+                universe=universe,
             )
-            for pair in pairs_engine.FIXED_PAIRS
+            for pair in universe
         }
         summary["leave_one_pair_out"] = {
             pair: _summarize_pair_trades(
@@ -1265,8 +1274,9 @@ def _summarize_pair_trades(
                 trial_count=trial_count,
                 observation_duration=observation_duration,
                 include_leave_one_pair_out=False,
+                universe=universe,
             )
-            for pair in pairs_engine.FIXED_PAIRS
+            for pair in universe
         }
     return summary
 
@@ -1274,6 +1284,7 @@ def _summarize_pair_trades(
 def summarize_pair_trades(
     trades: list[PairTrade], *, trial_count: int,
     observation_duration: pd.Timedelta | None = None,
+    universe=None,
 ) -> dict[str, object]:
     """Return deterministic diagnostics for one causal trade ledger."""
     return _summarize_pair_trades(
@@ -1281,6 +1292,7 @@ def summarize_pair_trades(
         trial_count=trial_count,
         observation_duration=observation_duration,
         include_leave_one_pair_out=True,
+        universe=universe,
     )
 
 
@@ -1298,7 +1310,9 @@ def _numeric_at_most(metrics: dict[str, object], key: str, threshold: float) -> 
     return isinstance(value, (int, float)) and np.isfinite(value) and value <= threshold
 
 
-def development_gate(metrics: dict[str, object]) -> GateDecision:
+def development_gate(metrics: dict[str, object], universe=None) -> GateDecision:
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
     failed = []
     per_pair_trades = metrics.get("per_pair_trades", {})
     per_pair = metrics.get("per_pair", {})
@@ -1306,7 +1320,7 @@ def development_gate(metrics: dict[str, object]) -> GateDecision:
         ("completed_trades", _numeric_at_least(metrics, "completed_trades", 60)),
         ("per_pair_trades", all(
             isinstance(per_pair_trades, dict) and per_pair_trades.get(pair, 0) >= 20
-            for pair in pairs_engine.FIXED_PAIRS
+            for pair in universe
         )),
         ("profit_factor", _numeric_at_least(metrics, "profit_factor", 1.15)),
         ("win_rate", _numeric_at_least(metrics, "win_rate", 0.50)),
@@ -1314,7 +1328,7 @@ def development_gate(metrics: dict[str, object]) -> GateDecision:
             isinstance(per_pair, dict)
             and isinstance(per_pair.get(pair), dict)
             and per_pair[pair].get("mean_net_return", 0.0) > 0.0
-            for pair in pairs_engine.FIXED_PAIRS
+            for pair in universe
         )),
         ("max_drawdown", _numeric_at_most(metrics, "max_drawdown", 0.15)),
         ("absolute_realized_btc_beta", _numeric_at_most(
@@ -1326,7 +1340,9 @@ def development_gate(metrics: dict[str, object]) -> GateDecision:
     return GateDecision(passed=not failed, failed_conditions=failed)
 
 
-def hard_pass_gate(metrics: dict[str, object]) -> GateDecision:
+def hard_pass_gate(metrics: dict[str, object], universe=None) -> GateDecision:
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
     failed = []
     per_pair_trades = metrics.get("per_pair_trades", {})
     per_pair = metrics.get("per_pair", {})
@@ -1346,19 +1362,19 @@ def hard_pass_gate(metrics: dict[str, object]) -> GateDecision:
         and isinstance(per_pair.get(pair), dict)
         and per_pair[pair].get("profit_factor", 0.0) >= 1.05
         and per_pair[pair].get("mean_net_return", 0.0) > 0.0
-        for pair in pairs_engine.FIXED_PAIRS
+        for pair in universe
     )
     concentration_ok = all(
         isinstance(per_pair, dict)
         and isinstance(per_pair.get(pair), dict)
         and per_pair[pair].get("gross_profit_contribution", 1.0) <= 0.65
-        for pair in pairs_engine.FIXED_PAIRS
+        for pair in universe
     )
     conditions = (
         ("completed_trades", _numeric_at_least(metrics, "completed_trades", 100)),
         ("per_pair_trades", all(
             isinstance(per_pair_trades, dict) and per_pair_trades.get(pair, 0) >= 35
-            for pair in pairs_engine.FIXED_PAIRS
+            for pair in universe
         )),
         ("profit_factor", _numeric_at_least(metrics, "profit_factor", 1.25)),
         ("win_rate", _numeric_at_least(metrics, "win_rate", 0.52)),
@@ -1685,6 +1701,7 @@ def _reprice_pair_trades(
 def _cost_stress_metrics(
     trades: list[PairTrade], *, base_config: PairsBacktestConfig, trial_count: int,
     observation_duration: pd.Timedelta | None = None,
+    universe=None,
 ) -> dict[str, dict[str, object]]:
     stress = {}
     for fee_bps, slippage_bps in _COST_STRESS_GRID:
@@ -1699,17 +1716,19 @@ def _cost_stress_metrics(
             trial_count=trial_count,
             observation_duration=observation_duration,
             include_leave_one_pair_out=False,
+            universe=universe,
         )
     return stress
 
 
 def _research_frames(
-    data: dict[str, PairMarketData],
+    data: dict[str, PairMarketData], universe,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
-    if set(data) != set(pairs_engine.FIXED_PAIRS):
-        raise ValueError(f"pairs experiment requires exactly {pairs_engine.FIXED_PAIRS}")
+    universe = tuple(universe)
+    if set(data) != set(universe):
+        raise ValueError(f"pairs experiment requires exactly {universe}")
     normalized_markets = {}
-    for pair in pairs_engine.FIXED_PAIRS:
+    for pair in universe:
         market = data[pair]
         alt_symbol, btc_symbol = pair.split("/")
         if (
@@ -1727,32 +1746,30 @@ def _research_frames(
             "btc_funding": _pairs_frame(market.btc_funding),
         }
 
-    first, second = (normalized_markets[pair] for pair in pairs_engine.FIXED_PAIRS)
-    for attribute, label in (
-        ("btc_1h", "1h"),
-        ("btc_15m", "15m"),
-        ("btc_funding", "funding"),
-    ):
-        left = first[attribute]
-        right = second[attribute]
-        if set(left.columns) != set(right.columns) or not left.loc[
-            :, sorted(left.columns)
-        ].equals(right.loc[:, sorted(right.columns)]):
-            raise ValueError(f"BTCUSDT {label} tapes differ between pair records")
+    reference = normalized_markets[universe[0]]
+    for pair in universe[1:]:
+        for attribute, label in (
+            ("btc_1h", "1h"),
+            ("btc_15m", "15m"),
+            ("btc_funding", "funding"),
+        ):
+            left = reference[attribute]
+            right = normalized_markets[pair][attribute]
+            if set(left.columns) != set(right.columns) or not left.loc[
+                :, sorted(left.columns)
+            ].equals(right.loc[:, sorted(right.columns)]):
+                raise ValueError(f"BTCUSDT {label} tapes differ between pair records")
 
-    eth = normalized_markets["ETHUSDT/BTCUSDT"]
-    sol = normalized_markets["SOLUSDT/BTCUSDT"]
-    hash_frames = {
-        "ETHUSDT:1h": eth["alt_1h"],
-        "ETHUSDT:15m": eth["alt_15m"],
-        "ETHUSDT:funding": eth["alt_funding"],
-        "SOLUSDT:1h": sol["alt_1h"],
-        "SOLUSDT:15m": sol["alt_15m"],
-        "SOLUSDT:funding": sol["alt_funding"],
-        "BTCUSDT:1h": eth["btc_1h"],
-        "BTCUSDT:15m": eth["btc_15m"],
-        "BTCUSDT:funding": eth["btc_funding"],
-    }
+    hash_frames = {}
+    for pair in universe:
+        alt_symbol = pair.split("/")[0]
+        market = normalized_markets[pair]
+        hash_frames[f"{alt_symbol}:1h"] = market["alt_1h"]
+        hash_frames[f"{alt_symbol}:15m"] = market["alt_15m"]
+        hash_frames[f"{alt_symbol}:funding"] = market["alt_funding"]
+    hash_frames["BTCUSDT:1h"] = reference["btc_1h"]
+    hash_frames["BTCUSDT:15m"] = reference["btc_15m"]
+    hash_frames["BTCUSDT:funding"] = reference["btc_funding"]
     interval_frames = {
         name: frame for name, frame in hash_frames.items()
         if name.endswith(":1h") or name.endswith(":15m")
@@ -1799,7 +1816,10 @@ def _run_pairs_windows(
     config: PairsBacktestConfig, params: pairs_engine.PairsParams,
     trial_count: int | None = None,
     include_diagnostics: bool = False,
+    universe=None,
 ) -> tuple[list[PairTrade], list[str]] | tuple[list[PairTrade], list[str], list[dict[str, object]]]:
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
     if params.formation_hours != 60 * 24:
         raise ValueError("pairs walk-forward requires a fixed 60-day formation window")
     trades = []
@@ -1836,10 +1856,11 @@ def _run_pairs_windows(
             window_end=window.end,
             config=config,
             params=params,
+            universe=universe,
         )
         window_trades = []
         window_invalid = []
-        for pair in pairs_engine.FIXED_PAIRS:
+        for pair in universe:
             result = results[pair]
             window_trades.extend(result.trades)
             window_invalid.extend(result.invalid_reasons)
@@ -1850,6 +1871,7 @@ def _run_pairs_windows(
                 window_trades,
                 trial_count=max(int(trial_count or 1), 1),
                 observation_duration=window.end - window.start,
+                universe=universe,
             )
             metrics["invalid_reasons"] = list(dict.fromkeys(window_invalid))
             window_reports.append({
@@ -1921,8 +1943,18 @@ def run_pairs_experiment(
     data: dict[str, PairMarketData], *, config: PairsBacktestConfig,
     params: pairs_engine.PairsParams, open_holdout: bool,
     ledger_path: Path,
+    universe=None,
 ) -> dict[str, object]:
-    """Run development validation and, at most once, the sealed holdout."""
+    """Run development validation and, at most once, the sealed holdout.
+
+    ``universe`` defaults to ``pairs_engine.FIXED_PAIRS`` (the historical
+    behaviour). The trial id hashes the phase, params, the ACTUAL cost
+    config, and the per-symbol dataset hashes (which encode the universe), so
+    distinct universe/cost combinations always map to distinct trial ids.
+    """
+    if universe is None:
+        universe = pairs_engine.FIXED_PAIRS
+    universe = tuple(universe)
     ledger_path = Path(ledger_path)
     with _trial_ledger_lock(ledger_path):
         initial_ledger = _read_trial_ledger(ledger_path)
@@ -1930,7 +1962,7 @@ def run_pairs_experiment(
             _write_ledger_document(ledger_path, initial_ledger)
     if open_holdout and initial_ledger["holdout"].get("status") != "sealed":
         raise ValueError("holdout already opened")
-    hash_frames, interval_frames = _research_frames(data)
+    hash_frames, interval_frames = _research_frames(data, universe)
     common_start, common_end = _common_history_bounds(interval_frames)
     schedule = build_walk_forward_schedule(common_start, common_end)
     dataset_hashes = {
@@ -1938,9 +1970,8 @@ def run_pairs_experiment(
     }
     dataset_hashes["all"] = dataset_hash(hash_frames)
 
-    nominal_config = replace(config, fee_bps=10.0, slippage_bps=2.0)
     development_trial_id = _deterministic_trial_id(
-        "development", params, nominal_config, dataset_hashes,
+        "development", params, config, dataset_hashes,
     )
     development_exists = any(
         trial["trial_id"] == development_trial_id
@@ -1957,31 +1988,34 @@ def run_pairs_experiment(
     development_trades, development_invalid, development_windows = _run_pairs_windows(
         data,
         windows=schedule.development_windows,
-        config=nominal_config,
+        config=config,
         params=params,
         trial_count=development_trial_count,
         include_diagnostics=True,
+        universe=universe,
     )
     development_metrics = summarize_pair_trades(
         development_trades,
         trial_count=development_trial_count,
         observation_duration=development_duration,
+        universe=universe,
     )
     development_cost_stress = _cost_stress_metrics(
         development_trades,
-        base_config=nominal_config,
+        base_config=config,
         trial_count=development_trial_count,
         observation_duration=development_duration,
+        universe=universe,
     )
     development_metrics["invalid_reasons"] = development_invalid
-    development_decision = development_gate(development_metrics)
+    development_decision = development_gate(development_metrics, universe=universe)
     development_recorded_at = datetime.now(timezone.utc).isoformat()
     development_trial = _trial_record(
         phase="development",
         trial_id=development_trial_id,
         recorded_at=development_recorded_at,
         params=params,
-        config=nominal_config,
+        config=config,
         dataset_hashes=dataset_hashes,
         schedule=schedule,
         metrics=development_metrics,
@@ -2018,7 +2052,7 @@ def run_pairs_experiment(
         return _json_safe(report)
 
     holdout_trial_id = _deterministic_trial_id(
-        "holdout", params, nominal_config, dataset_hashes,
+        "holdout", params, config, dataset_hashes,
     )
     holdout_recorded_at = datetime.now(timezone.utc).isoformat()
     pending_holdout = _trial_record(
@@ -2026,7 +2060,7 @@ def run_pairs_experiment(
         trial_id=holdout_trial_id,
         recorded_at=holdout_recorded_at,
         params=params,
-        config=nominal_config,
+        config=config,
         dataset_hashes=dataset_hashes,
         schedule=schedule,
         metrics={},
@@ -2044,8 +2078,9 @@ def run_pairs_experiment(
         holdout_trades, holdout_invalid = _run_pairs_windows(
             data,
             windows=[holdout_window],
-            config=nominal_config,
+            config=config,
             params=params,
+            universe=universe,
         )
     except Exception as exc:
         reason = f"holdout_replay_failed:{type(exc).__name__}:{exc}"
@@ -2059,21 +2094,25 @@ def run_pairs_experiment(
         combined_trades,
         trial_count=hard_trial_count,
         observation_duration=combined_duration,
+        universe=universe,
     )
     hard_cost_stress = _cost_stress_metrics(
         combined_trades,
-        base_config=nominal_config,
+        base_config=config,
         trial_count=hard_trial_count,
         observation_duration=combined_duration,
+        universe=universe,
     )
     hard_metrics["invalid_reasons"] = combined_invalid
-    hard_decision = hard_pass_gate({**hard_metrics, "cost_stress": hard_cost_stress})
+    hard_decision = hard_pass_gate(
+        {**hard_metrics, "cost_stress": hard_cost_stress}, universe=universe,
+    )
     holdout_trial = _trial_record(
         phase="holdout",
         trial_id=holdout_trial_id,
         recorded_at=holdout_recorded_at,
         params=params,
-        config=nominal_config,
+        config=config,
         dataset_hashes=dataset_hashes,
         schedule=schedule,
         metrics=hard_metrics,

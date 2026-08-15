@@ -1,4 +1,5 @@
 """Tests for the causal hourly relative-value relationship model."""
+import importlib.util
 import json
 import multiprocessing
 from dataclasses import replace
@@ -102,7 +103,7 @@ def make_two_pair_market_data(
 
 @pytest.fixture
 def replay_observations(monkeypatch):
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         current = hourly.iloc[-1]
         model_z = (
             np.log(float(current["alt_close"])) - np.log(float(current["btc_close"]))
@@ -373,7 +374,8 @@ def make_sparse_experiment_market_data() -> dict[str, bc.PairMarketData]:
     return data
 
 
-def passing_experiment_replay(data, *, window_start, window_end, config, params):
+def passing_experiment_replay(data, *, window_start, window_end, config, params,
+                              universe=None):
     results = {}
     for pair_index, pair in enumerate(pe.FIXED_PAIRS):
         trades = [
@@ -399,7 +401,8 @@ def passing_experiment_replay(data, *, window_start, window_end, config, params)
 _CONCURRENT_HOLDOUT_REPLAYS = None
 
 
-def concurrent_experiment_replay(data, *, window_start, window_end, config, params):
+def concurrent_experiment_replay(data, *, window_start, window_end, config, params,
+                                 universe=None):
     if window_end - window_start == pd.Timedelta(days=90):
         with _CONCURRENT_HOLDOUT_REPLAYS.get_lock():
             _CONCURRENT_HOLDOUT_REPLAYS.value += 1
@@ -603,17 +606,78 @@ def test_canonical_pair_identity_propagates_through_observations_and_signals(pai
     assert signal.pair == pair
 
 
-@pytest.mark.parametrize("pair", ["", "ETHUSDT/BTCUSDT ", "XRPUSDT/BTCUSDT"])
-def test_pair_observation_rejects_noncanonical_identity(pair):
+@pytest.mark.parametrize(
+    "pair",
+    ["", "ETHUSDT/BTCUSDT ", "BTCUSDT/BTCUSDT", "ETHUSDT", "ETH/BTCUSDT",
+     "ETHUSDT/ETHUSDT", "USDT/BTCUSDT"],
+)
+def test_pair_observation_rejects_malformed_identity(pair):
     with pytest.raises(ValueError, match="pair"):
         make_observation(zscore=2.25, beta=2.0, pair=pair)
 
 
-def test_hourly_observation_builder_requires_canonical_pair_identity():
+def test_pair_observation_accepts_wellformed_pair_outside_fixed_universe():
+    observation = make_observation(zscore=2.25, beta=2.0, pair="XRPUSDT/BTCUSDT")
+
+    assert observation.pair == "XRPUSDT/BTCUSDT"
+
+
+def test_hourly_observation_builder_requires_wellformed_pair_identity():
     hourly = make_cointegrated_hourly(hours=1_199)
 
     with pytest.raises(ValueError, match="pair"):
         pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="")
+
+
+def test_hourly_observation_builder_validates_against_caller_provided_universe():
+    hourly = make_cointegrated_hourly(hours=1_199)
+
+    # Well-formed but not in the default fixed universe: rejected.
+    with pytest.raises(ValueError, match="pair must be one of"):
+        pe.build_hourly_observations(
+            hourly, pe.DEFAULT_PARAMS, pair="XRPUSDT/BTCUSDT",
+        )
+    # The same pair is accepted when the caller's universe includes it.
+    observations = pe.build_hourly_observations(
+        hourly, pe.DEFAULT_PARAMS, pair="XRPUSDT/BTCUSDT",
+        universe=("XRPUSDT/BTCUSDT",),
+    )
+    assert observations["pair"].eq("XRPUSDT/BTCUSDT").all()
+
+
+def test_expanded_pairs_are_nineteen_wellformed_top_cap_alts():
+    assert len(pe.EXPANDED_PAIRS) == 19
+    assert pe.validate_pair_universe(pe.EXPANDED_PAIRS) == pe.EXPANDED_PAIRS
+    assert set(pe.FIXED_PAIRS) <= set(pe.EXPANDED_PAIRS)
+    symbols = pe.universe_symbols(pe.EXPANDED_PAIRS)
+    assert symbols[-1] == "BTCUSDT"
+    assert len(symbols) == 20
+    assert symbols[0] == "ETHUSDT"
+
+
+def test_validate_pair_universe_rejects_empty_duplicates_and_malformed():
+    with pytest.raises(ValueError, match="must not be empty"):
+        pe.validate_pair_universe(())
+    with pytest.raises(ValueError, match="duplicates"):
+        pe.validate_pair_universe(("ETHUSDT/BTCUSDT", "ETHUSDT/BTCUSDT"))
+    with pytest.raises(ValueError, match="ALTUSDT/BTCUSDT"):
+        pe.validate_pair_universe(("BTCUSDT/BTCUSDT",))
+    with pytest.raises(ValueError, match="ALTUSDT/BTCUSDT"):
+        pe.validate_pair_universe(("ETHUSDT",))
+
+
+def test_runner_universe_literals_match_the_engine_universes():
+    runner_path = (
+        Path(__file__).resolve().parent.parent / "ai_runners" / "backtest.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "backtest_runner_universe_check", runner_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.PAIR_UNIVERSE == pe.FIXED_PAIRS
+    assert module.EXPANDED_PAIR_UNIVERSE == pe.EXPANDED_PAIRS
 
 
 def test_exit_classification_prioritizes_structural_then_data_gap_then_divergence():
@@ -865,7 +929,7 @@ def test_missing_crossed_funding_timestamp_invalidates_pair_without_dropping_tra
 
 
 def test_observation_arriving_while_pair_is_open_is_not_queued_for_later(monkeypatch):
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         decision_ts = (
             pd.Timestamp("2024-01-01T06:00:00Z")
             if pair.startswith("ETH") else TS2 - pd.Timedelta(hours=1)
@@ -916,7 +980,7 @@ def test_observation_arriving_while_pair_is_open_is_not_queued_for_later(monkeyp
 
 
 def test_pre_window_signal_older_than_confirmation_window_is_expired(monkeypatch):
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         snapshot = pe.RelationshipSnapshot(
             alpha=0.0,
             beta=1.0,
@@ -969,7 +1033,7 @@ def test_confirmation_cannot_enter_under_a_new_unstable_snapshot(monkeypatch):
             rejection_reason=None if stable else "beta_change",
         )
 
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         if pair.startswith("SOL"):
             return pd.DataFrame([{
                 "pair": pair,
@@ -1041,7 +1105,7 @@ def test_unfillable_pending_exit_falls_back_to_boundary_without_backdating_reaso
 
 
 def test_entry_confirmed_on_final_bar_does_not_fill_at_exclusive_window_end(monkeypatch):
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         snapshot = pe.RelationshipSnapshot(
             alpha=0.0,
             beta=1.0,
@@ -1086,7 +1150,7 @@ def test_entry_confirmed_on_final_bar_does_not_fill_at_exclusive_window_end(monk
 
 
 def test_hourly_candle_is_not_available_until_one_hour_after_its_open(monkeypatch):
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         snapshot = pe.RelationshipSnapshot(
             alpha=0.0,
             beta=1.0,
@@ -1187,7 +1251,7 @@ def test_new_unstable_snapshot_at_fill_time_cancels_pending_entry(monkeypatch):
         }
     )
 
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         if pair.startswith("SOL"):
             return pd.DataFrame([{
                 "pair": pair,
@@ -1240,7 +1304,7 @@ def test_structural_exit_keeps_valid_price_mark_when_z_is_unavailable(monkeypatc
         rejection_reason=None,
     )
 
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         initial_z = 2.2 if pair.startswith("ETH") else 0.0
         direction = "SHORT_ALT_LONG_BTC" if pair.startswith("ETH") else None
         return pd.DataFrame([
@@ -1347,7 +1411,7 @@ def test_replay_rejects_engine_row_with_mismatched_pair_identity(monkeypatch):
         rejection_reason=None,
     )
 
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         row_pair = "SOLUSDT/BTCUSDT" if pair == "ETHUSDT/BTCUSDT" else pair
         return pd.DataFrame([{
             "pair": row_pair,
@@ -1388,7 +1452,7 @@ def test_asymmetric_two_trade_accounting_has_real_pnl_beta_and_compounding(monke
         rejection_reason=None,
     )
 
-    def build_observations(hourly, params, *, pair):
+    def build_observations(hourly, params, *, pair, universe=None):
         if pair.startswith("SOL"):
             return pd.DataFrame([{
                 "pair": pair,
@@ -1989,7 +2053,7 @@ def test_each_window_receives_only_its_declared_formation_and_trading_data(monke
     )
     inspected = []
 
-    def replay(sliced, *, window_start, window_end, config, params):
+    def replay(sliced, *, window_start, window_end, config, params, universe=None):
         for market in sliced.values():
             for frame in (market.alt_1h, market.btc_1h):
                 inspected.append((frame["ts"].min(), frame["ts"].max()))
@@ -2019,7 +2083,7 @@ def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before
 ):
     calls = []
 
-    def replay(data, *, window_start, window_end, config, params):
+    def replay(data, *, window_start, window_end, config, params, universe=None):
         calls.append((window_start, window_end, config.fee_bps, config.slippage_bps))
         return passing_experiment_replay(
             data,
@@ -2064,7 +2128,7 @@ def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before
 def test_experiment_development_failure_keeps_holdout_sealed(tmp_path, monkeypatch):
     calls = []
 
-    def replay(data, *, window_start, window_end, config, params):
+    def replay(data, *, window_start, window_end, config, params, universe=None):
         calls.append((window_start, window_end))
         return {
             pair: bc.PairsBacktestResult(
@@ -2160,6 +2224,110 @@ def test_trial_id_is_deterministic_for_fixed_phase_params_costs_and_frames(
     assert first["development"]["trial_id"] == second["development"]["trial_id"]
 
 
+def test_trial_id_changes_with_cost_scenario_and_universe(tmp_path, monkeypatch):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+    data = make_experiment_market_data()
+
+    legacy = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "legacy.json",
+    )
+    aster_taker = bc.run_pairs_experiment(
+        data,
+        config=replace(BASE_CONFIG, fee_bps=4.0),
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "taker.json",
+    )
+    aster_maker = bc.run_pairs_experiment(
+        data,
+        config=replace(
+            BASE_CONFIG,
+            fee_bps=2.0,
+            slippage_bps=0.0,
+            one_leg_execution_shock_bps=3.0,
+        ),
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "maker.json",
+    )
+    eth_only = bc.run_pairs_experiment(
+        {"ETHUSDT/BTCUSDT": data["ETHUSDT/BTCUSDT"]},
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "single.json",
+        universe=("ETHUSDT/BTCUSDT",),
+    )
+
+    trial_ids = {
+        legacy["development"]["trial_id"],
+        aster_taker["development"]["trial_id"],
+        aster_maker["development"]["trial_id"],
+        eth_only["development"]["trial_id"],
+    }
+    assert len(trial_ids) == 4
+
+
+def test_replay_supports_custom_universe_and_rejects_unknown_pairs():
+    data = make_two_pair_market_data()
+    eth_only = {"ETHUSDT/BTCUSDT": data["ETHUSDT/BTCUSDT"]}
+
+    result = bc.run_pairs_backtest(
+        eth_only,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+        universe=("ETHUSDT/BTCUSDT",),
+    )
+
+    assert set(result) == {"ETHUSDT/BTCUSDT"}
+    with pytest.raises(ValueError, match="unsupported pairs"):
+        bc.run_pairs_backtest(
+            data,
+            window_start=TS0,
+            window_end=TS_END,
+            config=BASE_CONFIG,
+            universe=("ETHUSDT/BTCUSDT",),
+        )
+
+
+def test_summary_and_development_gate_follow_the_caller_provided_universe():
+    trades = [
+        make_summary_trade(pair="XRPUSDT/BTCUSDT", entry_offset=index * 24)
+        for index in range(10)
+    ]
+
+    metrics = bc.summarize_pair_trades(
+        trades, trial_count=1, universe=("XRPUSDT/BTCUSDT",),
+    )
+
+    assert set(metrics["per_pair"]) == {"XRPUSDT/BTCUSDT"}
+    assert metrics["per_pair_trades"] == {"XRPUSDT/BTCUSDT": 10}
+    assert set(metrics["per_pair_diagnostics"]) == {"XRPUSDT/BTCUSDT"}
+    assert set(metrics["leave_one_pair_out"]) == {"XRPUSDT/BTCUSDT"}
+
+    gate_metrics = make_metrics(
+        per_pair_trades={"XRPUSDT/BTCUSDT": 60},
+        per_pair={
+            "XRPUSDT/BTCUSDT": {
+                "completed_trades": 60,
+                "profit_factor": 1.3,
+                "mean_net_return": 0.003,
+                "gross_profit_contribution": 1.0,
+            },
+        },
+    )
+    assert bc.development_gate(
+        gate_metrics, universe=("XRPUSDT/BTCUSDT",),
+    ).passed is True
+    # The default fixed universe still requires ETH and SOL rows.
+    assert bc.development_gate(gate_metrics).passed is False
+
+
 def test_same_cached_frames_produce_identical_report_and_dataset_hash(
     tmp_path, monkeypatch,
 ):
@@ -2205,10 +2373,30 @@ def test_identical_development_rerun_is_idempotent_in_one_ledger(tmp_path, monke
     assert len(json.loads(ledger.read_text())["trials"]) == 1
 
 
+def test_cost_scenarios_coexist_idempotently_in_one_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+    ledger = tmp_path / "ledger.json"
+    data = make_experiment_market_data()
+
+    for config in (BASE_CONFIG, replace(BASE_CONFIG, fee_bps=4.0)):
+        for _ in range(2):
+            bc.run_pairs_experiment(
+                data, config=config, params=pe.DEFAULT_PARAMS,
+                open_holdout=False, ledger_path=ledger,
+            )
+
+    persisted = json.loads(ledger.read_text())
+    assert len(persisted["trials"]) == 2
+    assert {trial["cost_config"]["fee_bps"] for trial in persisted["trials"]} == {
+        10.0, 4.0,
+    }
+    assert persisted["holdout"]["status"] == "sealed"
+
+
 def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_path, monkeypatch):
     calls = []
 
-    def replay(data, *, window_start, window_end, config, params):
+    def replay(data, *, window_start, window_end, config, params, universe=None):
         calls.append((window_start, window_end))
         if window_end - window_start == pd.Timedelta(days=90):
             raise RuntimeError("synthetic holdout failure")
@@ -2264,7 +2452,7 @@ def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_pat
 
 
 def test_hard_crash_leaves_pending_holdout_trial_as_consumed(tmp_path, monkeypatch):
-    def replay(data, *, window_start, window_end, config, params):
+    def replay(data, *, window_start, window_end, config, params, universe=None):
         if window_end - window_start == pd.Timedelta(days=90):
             raise KeyboardInterrupt("synthetic hard crash")
         return passing_experiment_replay(

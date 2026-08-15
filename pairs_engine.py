@@ -29,7 +29,74 @@ class PairsParams:
 
 
 DEFAULT_PARAMS = PairsParams()
+
+BTC_SYMBOL = "BTCUSDT"
+
+# Default research universe (unchanged historical behaviour).
 FIXED_PAIRS = ("ETHUSDT/BTCUSDT", "SOLUSDT/BTCUSDT")
+
+# Top-20-cap alts vs BTCUSDT for the expanded relative-value study.
+EXPANDED_PAIRS = (
+    "ETHUSDT/BTCUSDT",
+    "XRPUSDT/BTCUSDT",
+    "BNBUSDT/BTCUSDT",
+    "SOLUSDT/BTCUSDT",
+    "TRXUSDT/BTCUSDT",
+    "DOGEUSDT/BTCUSDT",
+    "ADAUSDT/BTCUSDT",
+    "LINKUSDT/BTCUSDT",
+    "XLMUSDT/BTCUSDT",
+    "SUIUSDT/BTCUSDT",
+    "AVAXUSDT/BTCUSDT",
+    "BCHUSDT/BTCUSDT",
+    "LTCUSDT/BTCUSDT",
+    "HBARUSDT/BTCUSDT",
+    "SHIBUSDT/BTCUSDT",
+    "TONUSDT/BTCUSDT",
+    "DOTUSDT/BTCUSDT",
+    "NEARUSDT/BTCUSDT",
+    "UNIUSDT/BTCUSDT",
+)
+
+
+def _validate_pair_string(pair: str) -> None:
+    """Require the well-formed ALTUSDT/BTCUSDT shape with alt != BTC."""
+    if not isinstance(pair, str):
+        raise ValueError(f"pair must be a string, got {pair!r}")
+    alt, separator, btc = pair.partition("/")
+    if (
+        separator != "/"
+        or btc != BTC_SYMBOL
+        or not alt.endswith("USDT")
+        or len(alt) <= len("USDT")
+        or alt == BTC_SYMBOL
+    ):
+        raise ValueError(f"pair must be of the form ALTUSDT/BTCUSDT, got {pair!r}")
+
+
+def validate_pair_universe(universe) -> tuple[str, ...]:
+    """Validate and freeze a caller-provided pair universe."""
+    pairs = tuple(universe)
+    if not pairs:
+        raise ValueError("pair universe must not be empty")
+    for pair in pairs:
+        _validate_pair_string(pair)
+    if len(set(pairs)) != len(pairs):
+        raise ValueError(f"pair universe contains duplicates: {pairs}")
+    return pairs
+
+
+def _require_canonical_pair(pair: str, universe=FIXED_PAIRS) -> None:
+    """Require a well-formed pair that belongs to the caller-provided universe."""
+    _validate_pair_string(pair)
+    if pair not in universe:
+        raise ValueError(f"pair must be one of {tuple(universe)}")
+
+
+def universe_symbols(universe) -> tuple[str, ...]:
+    """Unique spot symbols a universe needs: the alts in order, then BTCUSDT."""
+    alts = tuple(dict.fromkeys(pair.split("/")[0] for pair in universe))
+    return (*alts, BTC_SYMBOL)
 
 
 @dataclass(frozen=True)
@@ -57,7 +124,9 @@ class PairObservation:
     direction: str | None
 
     def __post_init__(self) -> None:
-        _require_canonical_pair(self.pair)
+        # The dataclass cannot know the caller's universe; enforce format here
+        # and universe membership in build_hourly_observations / the replay.
+        _validate_pair_string(self.pair)
 
 
 @dataclass(frozen=True)
@@ -109,11 +178,6 @@ def align_hourly_prices(alt_1h: pd.DataFrame, btc_1h: pd.DataFrame) -> pd.DataFr
         & (hourly["btc_close"] > 0.0)
     )
     return hourly.loc[valid].sort_values("ts").reset_index(drop=True)
-
-
-def _require_canonical_pair(pair: str) -> None:
-    if pair not in FIXED_PAIRS:
-        raise ValueError(f"pair must be one of {FIXED_PAIRS}")
 
 
 def _valid_history(history: pd.DataFrame, params: PairsParams) -> pd.DataFrame | None:
@@ -251,13 +315,15 @@ def build_hourly_observations(
     params: PairsParams,
     *,
     pair: str,
+    universe=FIXED_PAIRS,
 ) -> pd.DataFrame:
     """Build one causal relationship observation for each completed hourly bar.
 
     At timestamp ``t`` the model sees only the 1,440 rows immediately before
     ``t``; ``t`` is used solely to calculate the current residual and z-score.
+    ``universe`` is the caller-provided pair set ``pair`` must belong to.
     """
-    _require_canonical_pair(pair)
+    _require_canonical_pair(pair, universe)
     clean = _valid_history(hourly, replace(
         params,
         formation_hours=max(len(hourly), params.formation_hours),
