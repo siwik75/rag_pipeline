@@ -41,10 +41,14 @@ refetched. Callers that need warmup bars must include them in ``days``.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+
+import pairs_engine
 
 WARMUP_BARS = 200        # extra history before the window so indicators are mature
 WARMUP_BARS_1D = 80      # daily warmup (engine needs ~55 daily bars)
@@ -217,6 +221,646 @@ def load_funding(
         return _empty_funding()
     df.to_pickle(path)
     return df
+
+
+@dataclass(frozen=True)
+class PairMarketData:
+    pair: str
+    alt_symbol: str
+    btc_symbol: str
+    alt_1h: pd.DataFrame
+    btc_1h: pd.DataFrame
+    alt_15m: pd.DataFrame
+    btc_15m: pd.DataFrame
+    alt_funding: pd.DataFrame
+    btc_funding: pd.DataFrame
+
+
+@dataclass(frozen=True)
+class PairsBacktestConfig:
+    initial_equity: float = 10_000.0
+    risk_pct: float = 1.0
+    fee_bps: float = 10.0
+    slippage_bps: float = 2.0
+    one_leg_execution_shock_bps: float = 0.0
+
+
+@dataclass(frozen=True)
+class PairTrade:
+    pair: str
+    entry_ts: pd.Timestamp
+    exit_ts: pd.Timestamp
+    alt_side: str
+    btc_side: str
+    alt_weight: float
+    btc_weight: float
+    entry_z: float
+    exit_z: float | None
+    exit_reason: str
+    price_return: float
+    fee_return: float
+    slippage_return: float
+    funding_return: float
+    execution_shock_return: float
+    net_return: float
+    realized_btc_beta: float | None
+    mfe_z: float
+    mae_z: float
+    mfe_return: float
+    mae_return: float
+    funding_events: int
+    forced_close: bool
+    gross_notional: float
+    equity_before: float
+    pnl: float
+
+
+@dataclass(frozen=True)
+class PairsBacktestResult:
+    pair: str
+    trades: list[PairTrade]
+    metrics: dict[str, object]
+    invalid_reasons: list[str]
+
+
+def _pairs_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if "ts" not in frame.columns:
+        raise ValueError("pairs market data requires a ts column")
+    normalized = frame.copy()
+    normalized["ts"] = pd.to_datetime(normalized["ts"], utc=True)
+    return normalized.sort_values("ts").drop_duplicates("ts", keep="last").reset_index(drop=True)
+
+
+def _pairs_rows(frame: pd.DataFrame) -> dict[pd.Timestamp, pd.Series]:
+    return {pd.Timestamp(row["ts"]): row for _, row in _pairs_frame(frame).iterrows()}
+
+
+def _finite_price(row: pd.Series | None, column: str) -> float | None:
+    if row is None or column not in row:
+        return None
+    try:
+        value = float(row[column])
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value <= 0.0:
+        return None
+    return value
+
+
+def _pair_prices(
+    state: dict[str, object], ts: pd.Timestamp, column: str,
+) -> tuple[float, float] | None:
+    alt = _finite_price(state["alt_rows"].get(ts), column)
+    btc = _finite_price(state["btc_rows"].get(ts), column)
+    if alt is None or btc is None:
+        return None
+    return alt, btc
+
+
+def _pair_zscore(
+    state: dict[str, object], ts: pd.Timestamp,
+) -> tuple[pairs_engine.RelationshipSnapshot | None, float | None]:
+    observation = state["latest_observation"]
+    snapshot = observation.snapshot if observation is not None else None
+    prices = _pair_prices(state, ts, "close")
+    if snapshot is None or prices is None:
+        return snapshot, None
+    values = (
+        snapshot.alpha, snapshot.beta, snapshot.residual_mean, snapshot.residual_std,
+    )
+    if not all(np.isfinite(value) for value in values) or snapshot.residual_std <= 0.0:
+        return snapshot, None
+    alt_close, btc_close = prices
+    residual = math.log(alt_close) - (snapshot.alpha + snapshot.beta * math.log(btc_close))
+    zscore = (residual - snapshot.residual_mean) / snapshot.residual_std
+    return snapshot, float(zscore) if np.isfinite(zscore) else None
+
+
+def _side_sign(side: str) -> float:
+    return 1.0 if side == "LONG" else -1.0
+
+
+def _fill_price(price: float, side: str, *, entry: bool, slip: float) -> float:
+    side_sign = _side_sign(side)
+    adjustment = side_sign * slip if entry else -side_sign * slip
+    return price * (1.0 + adjustment)
+
+
+def _weighted_price_return(
+    position: dict[str, object], alt_exit: float, btc_exit: float, *, slipped: bool,
+) -> float:
+    alt_entry = float(position["alt_entry"])
+    btc_entry = float(position["btc_entry"])
+    if slipped:
+        alt_entry_fill = float(position["alt_entry_fill"])
+        btc_entry_fill = float(position["btc_entry_fill"])
+        alt_exit_fill = _fill_price(
+            alt_exit, position["signal"].alt_side, entry=False, slip=float(position["slip"]),
+        )
+        btc_exit_fill = _fill_price(
+            btc_exit, position["signal"].btc_side, entry=False, slip=float(position["slip"]),
+        )
+    else:
+        alt_entry_fill = alt_entry
+        btc_entry_fill = btc_entry
+        alt_exit_fill = alt_exit
+        btc_exit_fill = btc_exit
+    signal = position["signal"]
+    alt_return = (
+        signal.alt_weight * _side_sign(signal.alt_side)
+        * (alt_exit_fill - alt_entry_fill) / alt_entry
+    )
+    btc_return = (
+        signal.btc_weight * _side_sign(signal.btc_side)
+        * (btc_exit_fill - btc_entry_fill) / btc_entry
+    )
+    return float(alt_return + btc_return)
+
+
+def _funding_rows(frame: pd.DataFrame) -> dict[pd.Timestamp, float]:
+    if not {"ts", "funding_rate"}.issubset(frame.columns):
+        return {}
+    rates: dict[pd.Timestamp, float] = {}
+    for _, row in _pairs_frame(frame).iterrows():
+        try:
+            rate = float(row["funding_rate"])
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(rate):
+            rates[pd.Timestamp(row["ts"])] = rate
+    return rates
+
+
+def _expected_funding_times(entry_ts: pd.Timestamp, exit_ts: pd.Timestamp) -> list[pd.Timestamp]:
+    return [
+        pd.Timestamp(ts)
+        for ts in pd.date_range(
+            entry_ts.normalize(), exit_ts.normalize() + pd.Timedelta(days=1),
+            freq="8h", inclusive="left",
+        )
+        if entry_ts < ts <= exit_ts
+    ]
+
+
+def _trade_funding(
+    position: dict[str, object], exit_ts: pd.Timestamp, invalid_reasons: list[str],
+) -> tuple[float, int]:
+    market = position["market"]
+    signal = position["signal"]
+    entry_ts = position["entry_ts"]
+    alt_rates = _funding_rows(market.alt_funding)
+    btc_rates = _funding_rows(market.btc_funding)
+    funding_return = 0.0
+    funding_events = 0
+    for rates, side, weight in (
+        (alt_rates, signal.alt_side, signal.alt_weight),
+        (btc_rates, signal.btc_side, signal.btc_weight),
+    ):
+        for funding_ts, rate in rates.items():
+            if entry_ts < funding_ts <= exit_ts:
+                funding_return += -_side_sign(side) * weight * rate
+                funding_events += 1
+    for funding_ts in _expected_funding_times(entry_ts, exit_ts):
+        if funding_ts not in alt_rates or funding_ts not in btc_rates:
+            reason = f"missing_funding:{market.pair}:{funding_ts.isoformat()}"
+            if reason not in invalid_reasons:
+                invalid_reasons.append(reason)
+    return float(funding_return), funding_events
+
+
+def _realized_btc_beta(position: dict[str, object]) -> float | None:
+    pair_marks = np.asarray(position["pair_marks"], dtype=float)
+    btc_logs = np.asarray(position["btc_logs"], dtype=float)
+    if len(pair_marks) != len(btc_logs) or len(pair_marks) < 4:
+        return None
+    pair_increments = np.diff(pair_marks)
+    btc_increments = np.diff(btc_logs)
+    finite = np.isfinite(pair_increments) & np.isfinite(btc_increments)
+    if int(finite.sum()) < 3:
+        return None
+    x = btc_increments[finite]
+    y = pair_increments[finite]
+    centered_x = x - x.mean()
+    variance = float(centered_x @ centered_x)
+    if not np.isfinite(variance) or variance <= 0.0:
+        return None
+    slope = float(centered_x @ (y - y.mean()) / variance)
+    return slope if np.isfinite(slope) else None
+
+
+def _append_mark(
+    position: dict[str, object], zscore: float | None, alt_close: float, btc_close: float,
+) -> None:
+    gross_return = _weighted_price_return(position, alt_close, btc_close, slipped=False)
+    position["mfe_return"] = max(position["mfe_return"], gross_return)
+    position["mae_return"] = min(position["mae_return"], gross_return)
+    position["pair_marks"].append(gross_return)
+    position["btc_logs"].append(math.log(btc_close))
+    if zscore is not None and np.isfinite(zscore):
+        pair_direction = -1.0 if position["entry_z"] > 0.0 else 1.0
+        z_excursion = pair_direction * (zscore - position["entry_z"])
+        position["mfe_z"] = max(position["mfe_z"], z_excursion)
+        position["mae_z"] = min(position["mae_z"], z_excursion)
+        position["last_z"] = zscore
+
+
+def _complete_pair_trade(
+    position: dict[str, object], *, exit_ts: pd.Timestamp, exit_reason: str,
+    exit_z: float | None, invalid_reasons: list[str],
+) -> PairTrade | None:
+    prices = _pair_prices(position["state"], exit_ts, "open")
+    if prices is None:
+        return None
+    alt_exit, btc_exit = prices
+    signal = position["signal"]
+    price_return = _weighted_price_return(position, alt_exit, btc_exit, slipped=False)
+    slipped_price_return = _weighted_price_return(position, alt_exit, btc_exit, slipped=True)
+    slippage_return = slipped_price_return - price_return
+    fee_rate = float(position["fee_rate"])
+    fee_return = -fee_rate * (
+        signal.alt_weight + signal.btc_weight + signal.alt_weight + signal.btc_weight
+    )
+    funding_return, funding_events = _trade_funding(position, exit_ts, invalid_reasons)
+    execution_shock_return = float(position["execution_shock_return"])
+    net_return = (
+        price_return + fee_return + slippage_return
+        + funding_return + execution_shock_return
+    )
+    equity_before = float(position["equity_before"])
+    gross_notional = float(position["gross_notional"])
+    pnl = gross_notional * net_return
+    return PairTrade(
+        pair=position["market"].pair,
+        entry_ts=position["entry_ts"],
+        exit_ts=exit_ts,
+        alt_side=signal.alt_side,
+        btc_side=signal.btc_side,
+        alt_weight=signal.alt_weight,
+        btc_weight=signal.btc_weight,
+        entry_z=float(position["entry_z"]),
+        exit_z=exit_z,
+        exit_reason=exit_reason,
+        price_return=price_return,
+        fee_return=float(fee_return),
+        slippage_return=float(slippage_return),
+        funding_return=funding_return,
+        execution_shock_return=execution_shock_return,
+        net_return=float(net_return),
+        realized_btc_beta=_realized_btc_beta(position),
+        mfe_z=float(position["mfe_z"]),
+        mae_z=float(position["mae_z"]),
+        mfe_return=float(position["mfe_return"]),
+        mae_return=float(position["mae_return"]),
+        funding_events=funding_events,
+        forced_close=exit_reason in {"data_gap", "window_boundary"},
+        gross_notional=gross_notional,
+        equity_before=equity_before,
+        pnl=float(pnl),
+    )
+
+
+def _observation_rows(
+    market: PairMarketData, params: pairs_engine.PairsParams,
+) -> list[pairs_engine.PairObservation]:
+    hourly = pairs_engine.align_hourly_prices(market.alt_1h, market.btc_1h)
+    frame = pairs_engine.build_hourly_observations(hourly, params, pair=market.pair)
+    observations = []
+    for _, row in frame.iterrows():
+        snapshot = row.get("snapshot")
+        if not isinstance(snapshot, pairs_engine.RelationshipSnapshot):
+            snapshot = None
+        zscore = row.get("zscore")
+        zscore = float(zscore) if zscore is not None and np.isfinite(zscore) else None
+        direction = row.get("direction")
+        observations.append(pairs_engine.PairObservation(
+            pair=market.pair,
+            # CCXT labels OHLCV by candle open; the hourly close is usable one hour later.
+            ts=pd.Timestamp(row["ts"]) + pd.Timedelta(hours=1),
+            snapshot=snapshot,
+            zscore=zscore,
+            direction=direction if isinstance(direction, str) else None,
+        ))
+    return sorted(observations, key=lambda observation: observation.ts)
+
+
+def _advance_observations(
+    state: dict[str, object], available_ts: pd.Timestamp, *, suppress_entries: bool,
+) -> None:
+    observations = state["observations"]
+    while (
+        state["observation_index"] < len(observations)
+        and observations[state["observation_index"]].ts <= available_ts
+    ):
+        state["latest_observation"] = observations[state["observation_index"]]
+        if suppress_entries:
+            state["last_signal_observation_ts"] = state["latest_observation"].ts
+            state["pending_confirmation"] = None
+        state["observation_index"] += 1
+
+
+def _pairs_metrics(
+    trades: list[PairTrade], *, initial_equity: float, final_equity: float,
+    rejected_entries: int,
+) -> dict[str, object]:
+    weighted_beta_numerator = 0.0
+    weighted_beta_denominator = 0.0
+    for trade in trades:
+        if trade.realized_btc_beta is None or not np.isfinite(trade.realized_btc_beta):
+            continue
+        duration = max((trade.exit_ts - trade.entry_ts).total_seconds(), 0.0)
+        weight = trade.gross_notional * duration
+        weighted_beta_numerator += trade.realized_btc_beta * weight
+        weighted_beta_denominator += weight
+    aggregate_beta = (
+        abs(weighted_beta_numerator / weighted_beta_denominator)
+        if weighted_beta_denominator > 0.0 else None
+    )
+    return {
+        "completed_trades": len(trades),
+        "initial_equity": float(initial_equity),
+        "final_equity": float(final_equity),
+        "total_pnl": float(sum(trade.pnl for trade in trades)),
+        "absolute_realized_btc_beta": aggregate_beta,
+        "rejected_entries": rejected_entries,
+    }
+
+
+def run_pairs_backtest(
+    data: dict[str, PairMarketData], *, window_start: pd.Timestamp,
+    window_end: pd.Timestamp, config: PairsBacktestConfig,
+    params: pairs_engine.PairsParams = pairs_engine.DEFAULT_PARAMS,
+) -> dict[str, PairsBacktestResult]:
+    """Replay the fixed BTC-relative pairs on one synchronized 15m clock."""
+    window_start = pd.Timestamp(window_start)
+    window_end = pd.Timestamp(window_end)
+    window_start = (
+        window_start.tz_localize("UTC") if window_start.tzinfo is None
+        else window_start.tz_convert("UTC")
+    )
+    window_end = (
+        window_end.tz_localize("UTC") if window_end.tzinfo is None
+        else window_end.tz_convert("UTC")
+    )
+    if window_end <= window_start:
+        raise ValueError("window_end must be after window_start")
+
+    ordered_pairs = [pair for pair in pairs_engine.FIXED_PAIRS if pair in data]
+    unknown_pairs = set(data) - set(pairs_engine.FIXED_PAIRS)
+    if unknown_pairs:
+        raise ValueError(f"unsupported pairs: {sorted(unknown_pairs)}")
+    if not ordered_pairs:
+        return {}
+
+    states: dict[str, dict[str, object]] = {}
+    invalid_reasons = {pair: [] for pair in ordered_pairs}
+    trades = {pair: [] for pair in ordered_pairs}
+    rejected_entries = {pair: 0 for pair in ordered_pairs}
+    clock_values: set[pd.Timestamp] = set()
+    for pair in ordered_pairs:
+        market = data[pair]
+        if market.pair != pair:
+            raise ValueError(f"pair key {pair} does not match market data {market.pair}")
+        alt_rows = _pairs_rows(market.alt_15m)
+        btc_rows = _pairs_rows(market.btc_15m)
+        clock_values.update(alt_rows)
+        clock_values.update(btc_rows)
+        states[pair] = {
+            "market": market,
+            "alt_rows": alt_rows,
+            "btc_rows": btc_rows,
+            "observations": _observation_rows(market, params),
+            "observation_index": 0,
+            "latest_observation": None,
+            "pending_confirmation": None,
+            "last_signal_observation_ts": None,
+            "missing_bars": 0,
+        }
+
+    clock_values.update(pd.date_range(window_start, window_end, freq="15min"))
+    clock = sorted(ts for ts in clock_values if window_start <= ts <= window_end)
+    equity = float(config.initial_equity)
+    position: dict[str, object] | None = None
+    pending_entry: dict[str, object] | None = None
+    pending_exit: dict[str, object] | None = None
+    slip = float(config.slippage_bps) / 10_000.0
+    fee_rate = float(config.fee_bps) / 10_000.0
+    execution_shock_return = -float(config.one_leg_execution_shock_bps) / 10_000.0
+
+    for ts in clock:
+        entries_suppressed = position is not None or pending_entry is not None
+        for state in states.values():
+            _advance_observations(state, ts, suppress_entries=entries_suppressed)
+
+        if (
+            position is not None
+            and pending_exit is not None
+            and ts >= pending_exit["decision_ts"]
+        ):
+            trade = _complete_pair_trade(
+                position,
+                exit_ts=ts,
+                exit_reason=pending_exit["reason"],
+                exit_z=pending_exit["zscore"],
+                invalid_reasons=invalid_reasons[position["market"].pair],
+            )
+            if trade is not None:
+                trades[trade.pair].append(trade)
+                equity += trade.pnl
+                position = None
+                pending_exit = None
+                for state in states.values():
+                    state["pending_confirmation"] = None
+
+        if position is None and pending_entry is not None:
+            pair = pending_entry["pair"]
+            state = states[pair]
+            prices = _pair_prices(state, ts, "open")
+            latest_observation = state["latest_observation"]
+            fill_snapshot = (
+                latest_observation.snapshot if latest_observation is not None else None
+            )
+            if fill_snapshot is None or not fill_snapshot.stable:
+                pending_entry = None
+            elif prices is not None and pending_entry["decision_ts"] <= ts < window_end:
+                signal = pending_entry["signal"]
+                estimated_stop_return = (
+                    signal.alt_weight * (params.stop_z - abs(pending_entry["entry_z"]))
+                    * fill_snapshot.residual_std
+                )
+                if not np.isfinite(estimated_stop_return) or estimated_stop_return <= 0.0:
+                    rejected_entries[pair] += 1
+                else:
+                    gross_notional = min(
+                        equity,
+                        equity * float(config.risk_pct) / 100.0 / estimated_stop_return,
+                    )
+                    alt_entry, btc_entry = prices
+                    position = {
+                        "market": data[pair],
+                        "state": state,
+                        "signal": signal,
+                        "entry_ts": ts,
+                        "entry_z": float(pending_entry["entry_z"]),
+                        "last_z": float(pending_entry["entry_z"]),
+                        "alt_entry": alt_entry,
+                        "btc_entry": btc_entry,
+                        "alt_entry_fill": _fill_price(
+                            alt_entry, signal.alt_side, entry=True, slip=slip,
+                        ),
+                        "btc_entry_fill": _fill_price(
+                            btc_entry, signal.btc_side, entry=True, slip=slip,
+                        ),
+                        "slip": slip,
+                        "fee_rate": fee_rate,
+                        "execution_shock_return": execution_shock_return,
+                        "gross_notional": float(gross_notional),
+                        "equity_before": equity,
+                        "mfe_z": 0.0,
+                        "mae_z": 0.0,
+                        "mfe_return": 0.0,
+                        "mae_return": 0.0,
+                        "pair_marks": [0.0],
+                        "btc_logs": [math.log(btc_entry)],
+                    }
+                    state["missing_bars"] = 0
+                pending_entry = None
+
+        if ts >= window_end:
+            continue
+
+        # Fifteen-minute decisions happen at the candle close; the next row opens then.
+        close_ts = ts + pd.Timedelta(minutes=15)
+        entries_suppressed = position is not None or pending_entry is not None
+        for state in states.values():
+            _advance_observations(state, close_ts, suppress_entries=entries_suppressed)
+
+        if position is not None:
+            state = position["state"]
+            snapshot, zscore = _pair_zscore(state, ts)
+            close_prices = _pair_prices(state, ts, "close")
+            if close_prices is None:
+                state["missing_bars"] += 1
+            else:
+                state["missing_bars"] = 0
+                _append_mark(position, zscore, close_prices[0], close_prices[1])
+            if pending_exit is None:
+                exit_signal = pairs_engine.classify_exit(
+                    zscore=zscore,
+                    stable=snapshot.stable if snapshot is not None else None,
+                    entry_ts=position["entry_ts"],
+                    decision_ts=close_ts,
+                    consecutive_missing_bars=state["missing_bars"],
+                    params=params,
+                )
+                if exit_signal is not None:
+                    pending_exit = {
+                        "reason": exit_signal.reason,
+                        "zscore": zscore,
+                        "decision_ts": close_ts,
+                    }
+            continue
+
+        if pending_entry is not None:
+            continue
+
+        candidates = []
+        for pair in ordered_pairs:
+            state = states[pair]
+            observation = state["latest_observation"]
+            if (
+                observation is not None
+                and observation.ts != state["last_signal_observation_ts"]
+                and observation.direction is not None
+            ):
+                state["last_signal_observation_ts"] = observation.ts
+                signal = pairs_engine.make_signal(observation, params)
+                if signal is not None:
+                    elapsed_bars = max(
+                        0,
+                        int((close_ts - signal.decision_ts) // pd.Timedelta(minutes=15)),
+                    )
+                    if elapsed_bars <= params.confirmation_bars:
+                        state["pending_confirmation"] = pairs_engine.PendingConfirmation(
+                            signal=signal,
+                            bars_seen=max(0, elapsed_bars - 1),
+                        )
+            pending = state["pending_confirmation"]
+            if pending is None or close_ts <= pending.signal.decision_ts:
+                continue
+            snapshot, zscore = _pair_zscore(state, ts)
+            if snapshot is None or not snapshot.stable:
+                state["pending_confirmation"] = None
+                continue
+            confirmation = pairs_engine.advance_confirmation(pending, zscore, params)
+            state["pending_confirmation"] = confirmation.pending
+            if (
+                confirmation.entered
+                and snapshot is not None
+                and snapshot.stable
+                and zscore is not None
+            ):
+                candidates.append({
+                    "pair": pair,
+                    "signal": pending.signal,
+                    "snapshot": snapshot,
+                    "entry_z": zscore,
+                    "decision_ts": close_ts,
+                })
+
+        if candidates:
+            pair_priority = {pair: index for index, pair in enumerate(pairs_engine.FIXED_PAIRS)}
+            candidates.sort(key=lambda candidate: (
+                -abs(candidate["entry_z"]), pair_priority[candidate["pair"]],
+            ))
+            pending_entry = candidates[0]
+            for state in states.values():
+                state["pending_confirmation"] = None
+
+    if position is not None:
+        synchronized = [
+            ts for ts in clock
+            if position["entry_ts"] <= ts <= window_end
+            and _pair_prices(position["state"], ts, "open") is not None
+        ]
+        if synchronized:
+            later_exit_opens = (
+                [ts for ts in synchronized if ts >= pending_exit["decision_ts"]]
+                if pending_exit is not None else []
+            )
+            if later_exit_opens:
+                exit_ts = later_exit_opens[0]
+                reason = pending_exit["reason"]
+                exit_z = pending_exit["zscore"]
+            else:
+                exit_ts = synchronized[-1]
+                reason = "window_boundary"
+                exit_z = position["last_z"]
+            trade = _complete_pair_trade(
+                position,
+                exit_ts=exit_ts,
+                exit_reason=reason,
+                exit_z=exit_z,
+                invalid_reasons=invalid_reasons[position["market"].pair],
+            )
+            if trade is not None:
+                trades[trade.pair].append(trade)
+                equity += trade.pnl
+
+    return {
+        pair: PairsBacktestResult(
+            pair=pair,
+            trades=trades[pair],
+            metrics=_pairs_metrics(
+                trades[pair], initial_equity=config.initial_equity,
+                final_equity=(
+                    float(config.initial_equity) + sum(trade.pnl for trade in trades[pair])
+                ),
+                rejected_entries=rejected_entries[pair],
+            ),
+            invalid_reasons=invalid_reasons[pair],
+        )
+        for pair in ordered_pairs
+    }
 
 
 def run_backtest(

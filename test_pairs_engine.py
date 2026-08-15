@@ -3,7 +3,138 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import backtest_core as bc
 import pairs_engine as pe
+
+
+TS0 = pd.Timestamp("2024-01-01T07:30:00Z")
+TS1 = pd.Timestamp("2024-01-01T07:45:00Z")
+TS2 = pd.Timestamp("2024-01-01T08:00:00Z")
+TS3 = pd.Timestamp("2024-01-01T08:15:00Z")
+TS_END = pd.Timestamp("2024-01-01T08:30:00Z")
+BASE_CONFIG = bc.PairsBacktestConfig(
+    initial_equity=10_000.0,
+    risk_pct=1.0,
+    fee_bps=10.0,
+    slippage_bps=2.0,
+)
+
+
+def _fifteen_minute_leg(zscores: list[float], *, btc: bool) -> pd.DataFrame:
+    timestamps = pd.date_range(TS0, TS_END, freq="15min")
+    closes = np.full(len(timestamps), 100.0)
+    if not btc:
+        closes = 100.0 * np.exp(np.asarray(zscores) * 0.1)
+    return pd.DataFrame({
+        "ts": timestamps,
+        "open": 100.0,
+        "high": np.maximum(100.0, closes),
+        "low": np.minimum(100.0, closes),
+        "close": closes,
+        "volume": 1_000.0,
+    })
+
+
+def _hourly_leg(*, model_z: float, btc: bool) -> pd.DataFrame:
+    close = 100.0 if btc else 100.0 * np.exp(model_z * 0.1)
+    return pd.DataFrame({
+        "ts": [pd.Timestamp("2024-01-01T06:00:00Z")],
+        "open": [close],
+        "high": [close],
+        "low": [close],
+        "close": [close],
+        "volume": [1_000.0],
+        "model_z": [model_z],
+    })
+
+
+def _funding_leg(rate: float) -> pd.DataFrame:
+    return pd.DataFrame({"ts": [TS2], "funding_rate": [rate]})
+
+
+def make_two_pair_market_data(
+    *,
+    with_funding: bool = False,
+    missing_two_bars: bool = False,
+    no_exit_signal: bool = False,
+    sol_entry: bool = False,
+) -> dict[str, bc.PairMarketData]:
+    eth_zscores = [2.0, 1.8, 1.5 if no_exit_signal else 0.4, 1.4, 1.3]
+    eth_15m = _fifteen_minute_leg(eth_zscores, btc=False)
+    if missing_two_bars:
+        eth_15m = eth_15m.loc[~eth_15m["ts"].isin([TS2, TS3])].reset_index(drop=True)
+    alt_funding_rate = -0.0001 if with_funding else 0.0
+    btc_funding_rate = -0.0002 if with_funding else 0.0
+
+    eth = bc.PairMarketData(
+        pair="ETHUSDT/BTCUSDT",
+        alt_symbol="ETHUSDT",
+        btc_symbol="BTCUSDT",
+        alt_1h=_hourly_leg(model_z=2.2, btc=False),
+        btc_1h=_hourly_leg(model_z=0.0, btc=True),
+        alt_15m=eth_15m,
+        btc_15m=_fifteen_minute_leg([0.0] * 5, btc=True),
+        alt_funding=_funding_leg(alt_funding_rate),
+        btc_funding=_funding_leg(btc_funding_rate),
+    )
+    sol_zscores = eth_zscores if sol_entry else [0.0] * 5
+    sol = bc.PairMarketData(
+        pair="SOLUSDT/BTCUSDT",
+        alt_symbol="SOLUSDT",
+        btc_symbol="BTCUSDT",
+        alt_1h=_hourly_leg(model_z=2.2 if sol_entry else 0.0, btc=False),
+        btc_1h=_hourly_leg(model_z=0.0, btc=True),
+        alt_15m=_fifteen_minute_leg(sol_zscores, btc=False),
+        btc_15m=_fifteen_minute_leg([0.0] * 5, btc=True),
+        alt_funding=_funding_leg(0.0),
+        btc_funding=_funding_leg(0.0),
+    )
+    return {eth.pair: eth, sol.pair: sol}
+
+
+@pytest.fixture
+def replay_observations(monkeypatch):
+    def build_observations(hourly, params, *, pair):
+        current = hourly.iloc[-1]
+        model_z = (
+            np.log(float(current["alt_close"])) - np.log(float(current["btc_close"]))
+        ) / 0.1
+        snapshot = pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=model_z * 0.1,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=True,
+            rejection_reason=None,
+        )
+        direction = None
+        if model_z >= params.entry_z:
+            direction = "SHORT_ALT_LONG_BTC"
+        elif model_z <= -params.entry_z:
+            direction = "LONG_ALT_SHORT_BTC"
+        observation = pe.PairObservation(
+            pair=pair,
+            ts=pd.Timestamp(hourly.iloc[-1]["ts"]),
+            snapshot=snapshot,
+            zscore=model_z,
+            direction=direction,
+        )
+        return pd.DataFrame([{
+            "pair": pair,
+            "ts": observation.ts,
+            "snapshot": snapshot,
+            "zscore": model_z,
+            "direction": direction,
+            "beta": snapshot.beta,
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
 
 
 def make_observation(
@@ -243,3 +374,538 @@ def test_exit_classification_prioritizes_structural_then_data_gap_then_divergenc
         consecutive_missing_bars=0,
         params=pe.DEFAULT_PARAMS,
     ).reason == "convergence"
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_two_leg_entry_exit_uses_next_opens_and_charges_four_fills():
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+    trade = result["ETHUSDT/BTCUSDT"].trades[0]
+    assert trade.entry_ts == TS1
+    assert trade.exit_ts == TS3
+    assert trade.fee_return == pytest.approx(-4 * 10 / 10_000 * 0.5)
+    assert trade.slippage_return == pytest.approx(-4 * 2 / 10_000 * 0.5)
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_crossed_funding_is_leg_directional_and_not_asof_repeated():
+    trade = bc.run_pairs_backtest(
+        make_two_pair_market_data(with_funding=True),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+    assert trade.funding_return == pytest.approx(
+        (-0.0001 * trade.alt_weight) + (0.0002 * trade.btc_weight)
+    )
+    assert trade.funding_events == 2
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_sustained_missing_execution_data_force_closes_and_marks_trade():
+    trade = bc.run_pairs_backtest(
+        make_two_pair_market_data(missing_two_bars=True),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+    assert trade.exit_reason == "data_gap"
+    assert trade.forced_close is True
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_window_boundary_marks_open_pair_to_market_instead_of_dropping_it():
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(no_exit_signal=True),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+    trade = result["ETHUSDT/BTCUSDT"].trades[-1]
+    assert trade.exit_reason == "window_boundary"
+    assert result["ETHUSDT/BTCUSDT"].metrics["completed_trades"] == len(
+        result["ETHUSDT/BTCUSDT"].trades
+    )
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_exact_entry_tie_prefers_eth_and_keeps_only_one_pair_open():
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(sol_entry=True),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert len(result["ETHUSDT/BTCUSDT"].trades) == 1
+    assert result["SOLUSDT/BTCUSDT"].trades == []
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_risk_sizing_shock_and_currency_pnl_are_separate_and_reconcile():
+    config = bc.PairsBacktestConfig(
+        initial_equity=10_000.0,
+        risk_pct=1.0,
+        fee_bps=10.0,
+        slippage_bps=2.0,
+        one_leg_execution_shock_bps=25.0,
+    )
+    trade = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=config,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+
+    assert trade.gross_notional == pytest.approx(10_000 * 0.01 / (0.5 * 1.5 * 0.1))
+    assert trade.execution_shock_return == pytest.approx(-25 / 10_000)
+    assert trade.net_return == pytest.approx(
+        trade.price_return
+        + trade.fee_return
+        + trade.slippage_return
+        + trade.funding_return
+        + trade.execution_shock_return
+    )
+    assert trade.pnl == pytest.approx(trade.gross_notional * trade.net_return)
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_missing_crossed_funding_timestamp_invalidates_pair_without_dropping_trade():
+    data = make_two_pair_market_data()
+    eth = data["ETHUSDT/BTCUSDT"]
+    data[eth.pair] = bc.PairMarketData(
+        **{
+            **eth.__dict__,
+            "alt_funding": pd.DataFrame(columns=["ts", "funding_rate"]),
+        }
+    )
+
+    result = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"]
+
+    assert len(result.trades) == 1
+    assert result.invalid_reasons == [
+        "missing_funding:ETHUSDT/BTCUSDT:2024-01-01T08:00:00+00:00"
+    ]
+
+
+def test_observation_arriving_while_pair_is_open_is_not_queued_for_later(monkeypatch):
+    def build_observations(hourly, params, *, pair):
+        decision_ts = (
+            pd.Timestamp("2024-01-01T06:00:00Z")
+            if pair.startswith("ETH") else TS2 - pd.Timedelta(hours=1)
+        )
+        snapshot = pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=0.22,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=True,
+            rejection_reason=None,
+        )
+        return pd.DataFrame([{
+            "pair": pair,
+            "ts": decision_ts,
+            "snapshot": snapshot,
+            "zscore": 2.2,
+            "direction": "SHORT_ALT_LONG_BTC",
+            "beta": 1.0,
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    data = make_two_pair_market_data()
+    sol = data["SOLUSDT/BTCUSDT"]
+    sol_zscores = [0.0, 0.0, 2.0, 1.8, 1.7]
+    data[sol.pair] = bc.PairMarketData(
+        **{
+            **sol.__dict__,
+            "alt_15m": _fifteen_minute_leg(sol_zscores, btc=False),
+        }
+    )
+
+    result = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert len(result["ETHUSDT/BTCUSDT"].trades) == 1
+    assert result["SOLUSDT/BTCUSDT"].trades == []
+
+
+def test_pre_window_signal_older_than_confirmation_window_is_expired(monkeypatch):
+    def build_observations(hourly, params, *, pair):
+        snapshot = pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=0.22,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=True,
+            rejection_reason=None,
+        )
+        return pd.DataFrame([{
+            "pair": pair,
+            "ts": TS0 - pd.Timedelta(hours=2),
+            "snapshot": snapshot,
+            "zscore": 2.2 if pair.startswith("ETH") else 0.0,
+            "direction": "SHORT_ALT_LONG_BTC" if pair.startswith("ETH") else None,
+            "beta": 1.0,
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert result["ETHUSDT/BTCUSDT"].trades == []
+
+
+def test_confirmation_cannot_enter_under_a_new_unstable_snapshot(monkeypatch):
+    def snapshot(*, stable: bool) -> pe.RelationshipSnapshot:
+        return pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=0.22,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=stable,
+            rejection_reason=None if stable else "beta_change",
+        )
+
+    def build_observations(hourly, params, *, pair):
+        if pair.startswith("SOL"):
+            return pd.DataFrame([{
+                "pair": pair,
+                "ts": TS0 - pd.Timedelta(hours=1, minutes=30),
+                "snapshot": snapshot(stable=True),
+                "zscore": 0.0,
+                "direction": None,
+                "beta": 1.0,
+            }])
+        return pd.DataFrame([
+            {
+                "pair": pair,
+                "ts": TS0 - pd.Timedelta(hours=1, minutes=30),
+                "snapshot": snapshot(stable=True),
+                "zscore": 2.2,
+                "direction": "SHORT_ALT_LONG_BTC",
+                "beta": 1.0,
+            },
+            {
+                "pair": pair,
+                "ts": TS2 - pd.Timedelta(hours=1),
+                "snapshot": snapshot(stable=False),
+                "zscore": 1.8,
+                "direction": None,
+                "beta": 1.0,
+            },
+        ])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    data = make_two_pair_market_data()
+    eth = data["ETHUSDT/BTCUSDT"]
+    data[eth.pair] = bc.PairMarketData(
+        **{
+            **eth.__dict__,
+            "alt_15m": _fifteen_minute_leg([2.15, 2.15, 1.8, 0.4, 0.3], btc=False),
+        }
+    )
+
+    result = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert result["ETHUSDT/BTCUSDT"].trades == []
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_unfillable_pending_exit_falls_back_to_boundary_without_backdating_reason():
+    data = make_two_pair_market_data()
+    eth = data["ETHUSDT/BTCUSDT"]
+    data[eth.pair] = bc.PairMarketData(
+        **{
+            **eth.__dict__,
+            "alt_15m": eth.alt_15m.loc[eth.alt_15m["ts"] <= TS1].reset_index(drop=True),
+        }
+    )
+
+    trade = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+
+    assert trade.exit_ts == trade.entry_ts == TS1
+    assert trade.exit_reason == "window_boundary"
+
+
+def test_entry_confirmed_on_final_bar_does_not_fill_at_exclusive_window_end(monkeypatch):
+    def build_observations(hourly, params, *, pair):
+        snapshot = pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=0.22,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=True,
+            rejection_reason=None,
+        )
+        return pd.DataFrame([{
+            "pair": pair,
+            "ts": TS1 - pd.Timedelta(hours=1),
+            "snapshot": snapshot,
+            "zscore": 2.2 if pair.startswith("ETH") else 0.0,
+            "direction": "SHORT_ALT_LONG_BTC" if pair.startswith("ETH") else None,
+            "beta": 1.0,
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    data = make_two_pair_market_data()
+    eth = data["ETHUSDT/BTCUSDT"]
+    data[eth.pair] = bc.PairMarketData(
+        **{
+            **eth.__dict__,
+            "alt_15m": _fifteen_minute_leg([0.0, 2.2, 2.15, 1.8, 1.7], btc=False),
+        }
+    )
+
+    result = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert result["ETHUSDT/BTCUSDT"].trades == []
+
+
+def test_hourly_candle_is_not_available_until_one_hour_after_its_open(monkeypatch):
+    def build_observations(hourly, params, *, pair):
+        snapshot = pe.RelationshipSnapshot(
+            alpha=0.0,
+            beta=1.0,
+            residual=0.22,
+            residual_mean=0.0,
+            residual_std=0.1,
+            return_correlation=0.9,
+            adf_pvalue=0.01,
+            half_life_hours=12.0,
+            observations=1_440,
+            beta_change=0.0,
+            stable=True,
+            rejection_reason=None,
+        )
+        return pd.DataFrame([{
+            "pair": pair,
+            "ts": TS0,
+            "snapshot": snapshot,
+            "zscore": 2.2 if pair.startswith("ETH") else 0.0,
+            "direction": "SHORT_ALT_LONG_BTC" if pair.startswith("ETH") else None,
+            "beta": 1.0,
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert result["ETHUSDT/BTCUSDT"].trades == []
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_market_wide_two_bar_outage_still_triggers_data_gap_exit():
+    data = make_two_pair_market_data()
+    for pair, market in list(data.items()):
+        data[pair] = bc.PairMarketData(
+            **{
+                **market.__dict__,
+                "alt_15m": market.alt_15m.loc[
+                    ~market.alt_15m["ts"].isin([TS2, TS3])
+                ].reset_index(drop=True),
+                "btc_15m": market.btc_15m.loc[
+                    ~market.btc_15m["ts"].isin([TS2, TS3])
+                ].reset_index(drop=True),
+            }
+        )
+
+    trade = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+
+    assert trade.exit_reason == "data_gap"
+    assert trade.exit_ts == TS_END
+
+
+@pytest.mark.usefixtures("replay_observations")
+def test_each_pair_result_equity_reconciles_with_only_that_pairs_pnl():
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    for pair_result in result.values():
+        assert pair_result.metrics["final_equity"] == pytest.approx(
+            pair_result.metrics["initial_equity"] + pair_result.metrics["total_pnl"]
+        )
+
+
+def test_new_unstable_snapshot_at_fill_time_cancels_pending_entry(monkeypatch):
+    stable = pe.RelationshipSnapshot(
+        alpha=0.0,
+        beta=1.0,
+        residual=0.22,
+        residual_mean=0.0,
+        residual_std=0.1,
+        return_correlation=0.9,
+        adf_pvalue=0.01,
+        half_life_hours=12.0,
+        observations=1_440,
+        beta_change=0.0,
+        stable=True,
+        rejection_reason=None,
+    )
+    unstable = pe.RelationshipSnapshot(
+        **{
+            **stable.__dict__,
+            "stable": False,
+            "rejection_reason": "beta_change",
+        }
+    )
+
+    def build_observations(hourly, params, *, pair):
+        if pair.startswith("SOL"):
+            return pd.DataFrame([{
+                "pair": pair,
+                "ts": TS0 - pd.Timedelta(hours=1, minutes=30),
+                "snapshot": stable,
+                "zscore": 0.0,
+                "direction": None,
+            }])
+        return pd.DataFrame([
+            {
+                "pair": pair,
+                "ts": pd.Timestamp("2024-01-01T06:00:00Z"),
+                "snapshot": stable,
+                "zscore": 2.2,
+                "direction": "SHORT_ALT_LONG_BTC",
+            },
+            {
+                "pair": pair,
+                "ts": TS1 - pd.Timedelta(hours=1),
+                "snapshot": unstable,
+                "zscore": 1.8,
+                "direction": None,
+            },
+        ])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    result = bc.run_pairs_backtest(
+        make_two_pair_market_data(),
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )
+
+    assert result["ETHUSDT/BTCUSDT"].trades == []
+
+
+def test_structural_exit_keeps_valid_price_mark_when_z_is_unavailable(monkeypatch):
+    snapshot = pe.RelationshipSnapshot(
+        alpha=0.0,
+        beta=1.0,
+        residual=0.22,
+        residual_mean=0.0,
+        residual_std=0.1,
+        return_correlation=0.9,
+        adf_pvalue=0.01,
+        half_life_hours=12.0,
+        observations=1_440,
+        beta_change=0.0,
+        stable=True,
+        rejection_reason=None,
+    )
+
+    def build_observations(hourly, params, *, pair):
+        initial_z = 2.2 if pair.startswith("ETH") else 0.0
+        direction = "SHORT_ALT_LONG_BTC" if pair.startswith("ETH") else None
+        return pd.DataFrame([
+            {
+                "pair": pair,
+                "ts": pd.Timestamp("2024-01-01T06:00:00Z"),
+                "snapshot": snapshot,
+                "zscore": initial_z,
+                "direction": direction,
+            },
+            {
+                "pair": pair,
+                "ts": TS3 - pd.Timedelta(hours=1),
+                "snapshot": None,
+                "zscore": None,
+                "direction": None,
+            },
+        ])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    data = make_two_pair_market_data()
+    eth = data["ETHUSDT/BTCUSDT"]
+    eth_15m = eth.alt_15m.copy()
+    eth_15m.loc[eth_15m["ts"] == TS2, "close"] = 50.0
+    data[eth.pair] = bc.PairMarketData(**{**eth.__dict__, "alt_15m": eth_15m})
+
+    trade = bc.run_pairs_backtest(
+        data,
+        window_start=TS0,
+        window_end=TS_END,
+        config=BASE_CONFIG,
+    )["ETHUSDT/BTCUSDT"].trades[0]
+
+    assert trade.exit_reason == "structural"
+    assert trade.mfe_return == pytest.approx(0.25)
