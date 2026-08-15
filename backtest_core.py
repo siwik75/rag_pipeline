@@ -431,11 +431,13 @@ def _trade_funding(
 def _realized_btc_beta(position: dict[str, object]) -> float | None:
     pair_marks = np.asarray(position["pair_marks"], dtype=float)
     btc_logs = np.asarray(position["btc_logs"], dtype=float)
-    if len(pair_marks) != len(btc_logs) or len(pair_marks) < 4:
+    mark_ts = pd.DatetimeIndex(pd.to_datetime(position["mark_ts"], utc=True))
+    if not (len(pair_marks) == len(btc_logs) == len(mark_ts)) or len(pair_marks) < 4:
         return None
     pair_increments = np.diff(pair_marks)
     btc_increments = np.diff(btc_logs)
-    finite = np.isfinite(pair_increments) & np.isfinite(btc_increments)
+    consecutive = (mark_ts[1:] - mark_ts[:-1]) == pd.Timedelta(minutes=15)
+    finite = np.isfinite(pair_increments) & np.isfinite(btc_increments) & consecutive
     if int(finite.sum()) < 3:
         return None
     x = btc_increments[finite]
@@ -449,19 +451,25 @@ def _realized_btc_beta(position: dict[str, object]) -> float | None:
 
 
 def _append_mark(
-    position: dict[str, object], zscore: float | None, alt_close: float, btc_close: float,
+    position: dict[str, object], mark_ts: pd.Timestamp, zscore: float | None,
+    alt_close: float, btc_close: float,
 ) -> None:
     gross_return = _weighted_price_return(position, alt_close, btc_close, slipped=False)
     position["mfe_return"] = max(position["mfe_return"], gross_return)
     position["mae_return"] = min(position["mae_return"], gross_return)
     position["pair_marks"].append(gross_return)
     position["btc_logs"].append(math.log(btc_close))
+    position["mark_ts"].append(mark_ts)
     if zscore is not None and np.isfinite(zscore):
         pair_direction = -1.0 if position["entry_z"] > 0.0 else 1.0
         z_excursion = pair_direction * (zscore - position["entry_z"])
         position["mfe_z"] = max(position["mfe_z"], z_excursion)
         position["mae_z"] = min(position["mae_z"], z_excursion)
         position["last_z"] = zscore
+
+
+def _four_fill_fee_return(*, alt_weight: float, btc_weight: float, fee_rate: float) -> float:
+    return float(-fee_rate * (alt_weight + btc_weight + alt_weight + btc_weight))
 
 
 def _complete_pair_trade(
@@ -477,8 +485,10 @@ def _complete_pair_trade(
     slipped_price_return = _weighted_price_return(position, alt_exit, btc_exit, slipped=True)
     slippage_return = slipped_price_return - price_return
     fee_rate = float(position["fee_rate"])
-    fee_return = -fee_rate * (
-        signal.alt_weight + signal.btc_weight + signal.alt_weight + signal.btc_weight
+    fee_return = _four_fill_fee_return(
+        alt_weight=signal.alt_weight,
+        btc_weight=signal.btc_weight,
+        fee_rate=fee_rate,
     )
     funding_return, funding_events = _trade_funding(position, exit_ts, invalid_reasons)
     execution_shock_return = float(position["execution_shock_return"])
@@ -526,6 +536,10 @@ def _observation_rows(
     frame = pairs_engine.build_hourly_observations(hourly, params, pair=market.pair)
     observations = []
     for _, row in frame.iterrows():
+        if row.get("pair") != market.pair:
+            raise ValueError(
+                f"observation pair {row.get('pair')!r} does not match market pair {market.pair!r}"
+            )
         snapshot = row.get("snapshot")
         if not isinstance(snapshot, pairs_engine.RelationshipSnapshot):
             snapshot = None
@@ -569,10 +583,10 @@ def _pairs_metrics(
             continue
         duration = max((trade.exit_ts - trade.entry_ts).total_seconds(), 0.0)
         weight = trade.gross_notional * duration
-        weighted_beta_numerator += trade.realized_btc_beta * weight
+        weighted_beta_numerator += abs(trade.realized_btc_beta) * weight
         weighted_beta_denominator += weight
     aggregate_beta = (
-        abs(weighted_beta_numerator / weighted_beta_denominator)
+        weighted_beta_numerator / weighted_beta_denominator
         if weighted_beta_denominator > 0.0 else None
     )
     return {
@@ -721,6 +735,7 @@ def run_pairs_backtest(
                         "mae_return": 0.0,
                         "pair_marks": [0.0],
                         "btc_logs": [math.log(btc_entry)],
+                        "mark_ts": [ts],
                     }
                     state["missing_bars"] = 0
                 pending_entry = None
@@ -742,7 +757,7 @@ def run_pairs_backtest(
                 state["missing_bars"] += 1
             else:
                 state["missing_bars"] = 0
-                _append_mark(position, zscore, close_prices[0], close_prices[1])
+                _append_mark(position, close_ts, zscore, close_prices[0], close_prices[1])
             if pending_exit is None:
                 exit_signal = pairs_engine.classify_exit(
                     zscore=zscore,

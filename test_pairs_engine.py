@@ -540,7 +540,7 @@ def test_observation_arriving_while_pair_is_open_is_not_queued_for_later(monkeyp
     result = bc.run_pairs_backtest(
         data,
         window_start=TS0,
-        window_end=TS_END,
+        window_end=TS_END + pd.Timedelta(minutes=15),
         config=BASE_CONFIG,
     )
 
@@ -909,3 +909,225 @@ def test_structural_exit_keeps_valid_price_mark_when_z_is_unavailable(monkeypatc
 
     assert trade.exit_reason == "structural"
     assert trade.mfe_return == pytest.approx(0.25)
+
+
+def test_absolute_realized_beta_does_not_cancel_opposite_trade_slopes():
+    common = {
+        "pair": "ETHUSDT/BTCUSDT",
+        "entry_ts": TS0,
+        "exit_ts": TS_END,
+        "alt_side": "SHORT",
+        "btc_side": "LONG",
+        "alt_weight": 0.25,
+        "btc_weight": 0.75,
+        "entry_z": 2.0,
+        "exit_z": 0.4,
+        "exit_reason": "convergence",
+        "price_return": 0.01,
+        "fee_return": -0.002,
+        "slippage_return": -0.0004,
+        "funding_return": 0.0,
+        "execution_shock_return": 0.0,
+        "net_return": 0.0076,
+        "mfe_z": 1.6,
+        "mae_z": 0.0,
+        "mfe_return": 0.01,
+        "mae_return": 0.0,
+        "funding_events": 0,
+        "forced_close": False,
+        "gross_notional": 1_000.0,
+        "equity_before": 10_000.0,
+        "pnl": 7.6,
+    }
+    trades = [
+        bc.PairTrade(**common, realized_btc_beta=0.2),
+        bc.PairTrade(**common, realized_btc_beta=-0.2),
+    ]
+
+    metrics = bc._pairs_metrics(
+        trades,
+        initial_equity=10_000.0,
+        final_equity=10_015.2,
+        rejected_entries=0,
+    )
+
+    assert metrics["absolute_realized_btc_beta"] == pytest.approx(0.2)
+
+
+def test_realized_beta_ignores_nonconsecutive_mark_intervals():
+    position = {
+        "pair_marks": [0.0, 0.01, 0.04, 0.02],
+        "btc_logs": [0.0, 0.01, 0.02, 0.04],
+        "mark_ts": [TS0, TS1, TS3, TS_END],
+    }
+
+    assert bc._realized_btc_beta(position) is None
+
+
+def test_replay_rejects_engine_row_with_mismatched_pair_identity(monkeypatch):
+    snapshot = pe.RelationshipSnapshot(
+        alpha=0.0,
+        beta=1.0,
+        residual=0.22,
+        residual_mean=0.0,
+        residual_std=0.1,
+        return_correlation=0.9,
+        adf_pvalue=0.01,
+        half_life_hours=12.0,
+        observations=1_440,
+        beta_change=0.0,
+        stable=True,
+        rejection_reason=None,
+    )
+
+    def build_observations(hourly, params, *, pair):
+        row_pair = "SOLUSDT/BTCUSDT" if pair == "ETHUSDT/BTCUSDT" else pair
+        return pd.DataFrame([{
+            "pair": row_pair,
+            "ts": pd.Timestamp("2024-01-01T06:00:00Z"),
+            "snapshot": snapshot,
+            "zscore": 2.2,
+            "direction": "SHORT_ALT_LONG_BTC",
+        }])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+
+    with pytest.raises(ValueError, match="pair"):
+        bc.run_pairs_backtest(
+            make_two_pair_market_data(),
+            window_start=TS0,
+            window_end=TS_END,
+            config=BASE_CONFIG,
+        )
+
+
+def test_asymmetric_two_trade_accounting_has_real_pnl_beta_and_compounding(monkeypatch):
+    start = pd.Timestamp("2024-01-02T07:00:00Z")
+    end = pd.Timestamp("2024-01-02T10:00:00Z")
+    timestamps = pd.date_range(start, end, freq="15min")
+    alpha = -2.0 * np.log(100.0)
+    snapshot = pe.RelationshipSnapshot(
+        alpha=alpha,
+        beta=3.0,
+        residual=0.2,
+        residual_mean=0.0,
+        residual_std=0.1,
+        return_correlation=0.9,
+        adf_pvalue=0.01,
+        half_life_hours=12.0,
+        observations=1_440,
+        beta_change=0.0,
+        stable=True,
+        rejection_reason=None,
+    )
+
+    def build_observations(hourly, params, *, pair):
+        if pair.startswith("SOL"):
+            return pd.DataFrame([{
+                "pair": pair,
+                "ts": start - pd.Timedelta(hours=1),
+                "snapshot": snapshot,
+                "zscore": 0.0,
+                "direction": None,
+            }])
+        return pd.DataFrame([
+            {
+                "pair": pair,
+                "ts": start - pd.Timedelta(hours=1),
+                "snapshot": snapshot,
+                "zscore": 2.2,
+                "direction": "SHORT_ALT_LONG_BTC",
+            },
+            {
+                "pair": pair,
+                "ts": start + pd.Timedelta(minutes=30),
+                "snapshot": snapshot,
+                "zscore": 2.2,
+                "direction": "SHORT_ALT_LONG_BTC",
+            },
+        ])
+
+    monkeypatch.setattr(pe, "build_hourly_observations", build_observations)
+    zscores = [2.0, 1.8, 1.5, 1.0, 0.4, 1.5, 2.0, 1.8, 1.5, 1.0, 0.4, 0.3, 0.2]
+    btc_closes = [100.0, 101.0, 99.0, 102.0, 100.0, 100.0, 100.0,
+                  101.0, 99.0, 102.0, 100.0, 100.0, 100.0]
+    alt_closes = [
+        np.exp(alpha + 3.0 * np.log(btc_close) + 0.1 * zscore)
+        for btc_close, zscore in zip(btc_closes, zscores)
+    ]
+
+    def leg_frame(*, alt: bool) -> pd.DataFrame:
+        closes = np.asarray(alt_closes if alt else btc_closes)
+        opens = np.full(len(timestamps), 100.0)
+        if alt:
+            opens[timestamps.get_loc(start + pd.Timedelta(minutes=75))] = 90.0
+            opens[timestamps.get_loc(start + pd.Timedelta(minutes=105))] = 120.0
+            opens[timestamps.get_loc(start + pd.Timedelta(minutes=165))] = 132.0
+        else:
+            opens[timestamps.get_loc(start + pd.Timedelta(minutes=75))] = 110.0
+            opens[timestamps.get_loc(start + pd.Timedelta(minutes=165))] = 90.0
+        return pd.DataFrame({
+            "ts": timestamps,
+            "open": opens,
+            "high": np.maximum(opens, closes),
+            "low": np.minimum(opens, closes),
+            "close": closes,
+            "volume": 1_000.0,
+        })
+
+    empty_hourly = _hourly_leg(model_z=0.0, btc=True)
+    zero_funding = pd.DataFrame({
+        "ts": [pd.Timestamp("2024-01-02T08:00:00Z")],
+        "funding_rate": [0.0],
+    })
+    eth = bc.PairMarketData(
+        pair="ETHUSDT/BTCUSDT",
+        alt_symbol="ETHUSDT",
+        btc_symbol="BTCUSDT",
+        alt_1h=empty_hourly,
+        btc_1h=empty_hourly,
+        alt_15m=leg_frame(alt=True),
+        btc_15m=leg_frame(alt=False),
+        alt_funding=zero_funding,
+        btc_funding=zero_funding,
+    )
+    sol = bc.PairMarketData(
+        pair="SOLUSDT/BTCUSDT",
+        alt_symbol="SOLUSDT",
+        btc_symbol="BTCUSDT",
+        alt_1h=empty_hourly,
+        btc_1h=empty_hourly,
+        alt_15m=leg_frame(alt=True),
+        btc_15m=leg_frame(alt=False),
+        alt_funding=zero_funding,
+        btc_funding=zero_funding,
+    )
+    config = bc.PairsBacktestConfig(slippage_bps=0.0)
+
+    trades = bc.run_pairs_backtest(
+        {eth.pair: eth, sol.pair: sol},
+        window_start=start,
+        window_end=end,
+        config=config,
+    )[eth.pair].trades
+
+    assert len(trades) == 2
+    first, second = trades
+    assert (first.alt_weight, first.btc_weight) == pytest.approx((0.25, 0.75))
+    assert first.price_return == pytest.approx(0.10)
+    assert second.price_return == pytest.approx(-0.10)
+    assert first.fee_return == pytest.approx(-0.002)
+    assert second.fee_return == pytest.approx(-0.002)
+    assert first.realized_btc_beta == pytest.approx(-0.42714659602131466)
+    assert second.equity_before == pytest.approx(first.equity_before + first.pnl)
+    assert second.gross_notional == pytest.approx(
+        second.equity_before * 0.01 / (0.25 * 1.5 * 0.1)
+    )
+
+
+def test_four_fill_fee_uses_actual_leg_weights_instead_of_half_constants():
+    assert bc._four_fill_fee_return(
+        alt_weight=0.25,
+        btc_weight=0.50,
+        fee_rate=0.001,
+    ) == pytest.approx(-0.0015)
