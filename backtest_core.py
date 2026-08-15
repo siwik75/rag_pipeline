@@ -261,6 +261,19 @@ def normalize_pairs_funding(
     return normalized.sort_values("ts").reset_index(drop=True)
 
 
+def prepare_pairs_funding(
+    frame: pd.DataFrame, *, symbol: str, window_end,
+) -> pd.DataFrame:
+    """Normalize funding timestamps before applying the inclusive end boundary."""
+    normalized = normalize_pairs_funding(frame, symbol=symbol)
+    boundary = pd.Timestamp(window_end)
+    if boundary.tzinfo is None:
+        boundary = boundary.tz_localize("UTC")
+    else:
+        boundary = boundary.tz_convert("UTC")
+    return normalized.loc[normalized["ts"] <= boundary].reset_index(drop=True)
+
+
 @dataclass(frozen=True)
 class PairMarketData:
     pair: str
@@ -1917,8 +1930,6 @@ def run_pairs_experiment(
             _write_ledger_document(ledger_path, initial_ledger)
     if open_holdout and initial_ledger["holdout"].get("status") != "sealed":
         raise ValueError("holdout already opened")
-    historical_trial_count = len(initial_ledger["trials"])
-
     hash_frames, interval_frames = _research_frames(data)
     common_start, common_end = _common_history_bounds(interval_frames)
     schedule = build_walk_forward_schedule(common_start, common_end)
@@ -1928,12 +1939,21 @@ def run_pairs_experiment(
     dataset_hashes["all"] = dataset_hash(hash_frames)
 
     nominal_config = replace(config, fee_bps=10.0, slippage_bps=2.0)
+    development_trial_id = _deterministic_trial_id(
+        "development", params, nominal_config, dataset_hashes,
+    )
+    development_exists = any(
+        trial["trial_id"] == development_trial_id
+        for trial in initial_ledger["trials"]
+    )
+    development_trial_count = len(initial_ledger["trials"]) + (
+        0 if development_exists else 1
+    )
+    development_trial_count = max(development_trial_count, 1)
     development_duration = sum(
         (window.end - window.start for window in schedule.development_windows),
         pd.Timedelta(0),
     )
-    development_trial_count = historical_trial_count + (0 if open_holdout else 1)
-    development_trial_count = max(development_trial_count, 1)
     development_trades, development_invalid, development_windows = _run_pairs_windows(
         data,
         windows=schedule.development_windows,
@@ -1955,9 +1975,6 @@ def run_pairs_experiment(
     )
     development_metrics["invalid_reasons"] = development_invalid
     development_decision = development_gate(development_metrics)
-    development_trial_id = _deterministic_trial_id(
-        "development", params, nominal_config, dataset_hashes,
-    )
     development_recorded_at = datetime.now(timezone.utc).isoformat()
     development_trial = _trial_record(
         phase="development",
@@ -1989,16 +2006,14 @@ def run_pairs_experiment(
             "status": "sealed",
         },
     }
+    if not development_exists:
+        write_trial_ledger(ledger_path, development_trial)
     if open_holdout and not development_decision.passed:
         report["request_error"] = {
             "code": "development_gate_failed",
             "failed_conditions": list(development_decision.failed_conditions),
         }
         return _json_safe(report)
-    if not any(
-        trial["trial_id"] == development_trial_id for trial in initial_ledger["trials"]
-    ):
-        write_trial_ledger(ledger_path, development_trial)
     if not open_holdout:
         return _json_safe(report)
 

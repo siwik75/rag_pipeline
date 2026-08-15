@@ -735,6 +735,43 @@ def test_pairs_funding_rejects_duplicate_or_conflicting_nominal_rows(rates):
         bc.normalize_pairs_funding(raw, symbol="ETHUSDT")
 
 
+@pytest.mark.parametrize("offset_ms", [0, 16])
+def test_pairs_funding_is_normalized_before_inclusive_window_slice(offset_ms):
+    boundary = pd.Timestamp("2026-01-21T08:00:00Z")
+    raw = pd.DataFrame({
+        "ts": [boundary + pd.Timedelta(milliseconds=offset_ms)],
+        "funding_rate": [0.0001],
+    })
+
+    prepared = bc.prepare_pairs_funding(
+        raw, symbol="ETHUSDT", window_end=boundary,
+    )
+
+    assert prepared["ts"].tolist() == [boundary]
+
+
+def test_pairs_funding_after_window_or_outside_tolerance_does_not_survive():
+    boundary = pd.Timestamp("2026-01-21T08:00:00Z")
+    next_boundary = boundary + pd.Timedelta(hours=8)
+    after_window = pd.DataFrame({
+        "ts": [next_boundary + pd.Timedelta(milliseconds=16)],
+        "funding_rate": [0.0001],
+    })
+
+    assert bc.prepare_pairs_funding(
+        after_window, symbol="ETHUSDT", window_end=boundary,
+    ).empty
+    with pytest.raises(ValueError, match="off-schedule funding timestamp"):
+        bc.prepare_pairs_funding(
+            pd.DataFrame({
+                "ts": [boundary + pd.Timedelta(seconds=1, milliseconds=1)],
+                "funding_rate": [0.0001],
+            }),
+            symbol="ETHUSDT",
+            window_end=boundary,
+        )
+
+
 @pytest.mark.usefixtures("replay_observations")
 def test_sustained_missing_execution_data_force_closes_and_marks_trade():
     trade = bc.run_pairs_backtest(
@@ -2059,7 +2096,21 @@ def test_experiment_development_failure_keeps_holdout_sealed(tmp_path, monkeypat
     }
     persisted = json.loads(ledger_path.read_text())
     assert persisted["holdout"]["status"] == "sealed"
-    assert persisted["trials"] == []
+    assert len(persisted["trials"]) == 1
+    assert persisted["trials"][0]["trial_id"] == report["development"]["trial_id"]
+    assert persisted["trials"][0]["gate"]["passed"] is False
+
+    repeated = bc.run_pairs_experiment(
+        make_experiment_market_data(),
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=True,
+        ledger_path=ledger_path,
+    )
+    repeated_ledger = json.loads(ledger_path.read_text())
+    assert len(repeated_ledger["trials"]) == 1
+    assert repeated["development"]["trial_id"] == report["development"]["trial_id"]
+    assert repeated["development"]["metrics"] == report["development"]["metrics"]
 
 
 def test_development_report_preserves_window_metrics_without_stress_duplication(
@@ -2107,6 +2158,26 @@ def test_trial_id_is_deterministic_for_fixed_phase_params_costs_and_frames(
     )
 
     assert first["development"]["trial_id"] == second["development"]["trial_id"]
+
+
+def test_identical_development_rerun_is_idempotent_in_one_ledger(tmp_path, monkeypatch):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+    ledger = tmp_path / "ledger.json"
+    data = make_experiment_market_data()
+
+    first = bc.run_pairs_experiment(
+        data, config=BASE_CONFIG, params=pe.DEFAULT_PARAMS,
+        open_holdout=False, ledger_path=ledger,
+    )
+    second = bc.run_pairs_experiment(
+        data, config=BASE_CONFIG, params=pe.DEFAULT_PARAMS,
+        open_holdout=False, ledger_path=ledger,
+    )
+
+    assert second["development"]["trial_id"] == first["development"]["trial_id"]
+    assert second["development"]["metrics"] == first["development"]["metrics"]
+    assert second["development"]["windows"] == first["development"]["windows"]
+    assert len(json.loads(ledger.read_text())["trials"]) == 1
 
 
 def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_path, monkeypatch):
@@ -2164,7 +2235,7 @@ def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_pat
         open_holdout=False,
         ledger_path=ledger,
     )
-    assert later_development["development"]["metrics"]["trial_count"] == 3
+    assert later_development["development"]["metrics"]["trial_count"] == 2
 
 
 def test_hard_crash_leaves_pending_holdout_trial_as_consumed(tmp_path, monkeypatch):
