@@ -1,5 +1,8 @@
 """Tests for the causal hourly relative-value relationship model."""
 import json
+import multiprocessing
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -190,12 +193,16 @@ def make_summary_trade(
     alt_side: str = "LONG",
     realized_btc_beta: float = 0.05,
     entry_offset: int = 0,
+    entry_ts: pd.Timestamp | None = None,
+    holding_hours: float = 12.0,
+    gross_notional: float = 1_000.0,
+    equity_before: float = 10_000.0,
 ) -> bc.PairTrade:
-    entry_ts = COMMON_START + pd.Timedelta(hours=entry_offset)
+    entry_ts = entry_ts or COMMON_START + pd.Timedelta(hours=entry_offset)
     return bc.PairTrade(
         pair=pair,
         entry_ts=entry_ts,
-        exit_ts=entry_ts + pd.Timedelta(hours=12),
+        exit_ts=entry_ts + pd.Timedelta(hours=holding_hours),
         alt_side=alt_side,
         btc_side="SHORT" if alt_side == "LONG" else "LONG",
         alt_weight=0.5,
@@ -216,9 +223,9 @@ def make_summary_trade(
         mae_return=min(net_return, 0.0) - 0.002,
         funding_events=2,
         forced_close=False,
-        gross_notional=1_000.0,
-        equity_before=10_000.0,
-        pnl=1_000.0 * net_return,
+        gross_notional=gross_notional,
+        equity_before=equity_before,
+        pnl=gross_notional * net_return,
     )
 
 
@@ -260,44 +267,81 @@ def make_metrics(**overrides) -> dict[str, object]:
     return metrics
 
 
+def make_hard_boundary_metrics() -> dict[str, object]:
+    metrics = make_metrics(
+        completed_trades=100,
+        per_pair_trades={"ETHUSDT/BTCUSDT": 50, "SOLUSDT/BTCUSDT": 50},
+        profit_factor=1.25,
+        win_rate=0.52,
+        max_drawdown=0.15,
+        absolute_realized_btc_beta=0.15,
+        deflated_sharpe_probability=0.95,
+        bootstrap_mean_net_return_ci_95=[0.000001, 0.006],
+    )
+    metrics["per_pair"] = {
+        "ETHUSDT/BTCUSDT": {
+            "completed_trades": 50,
+            "profit_factor": 1.05,
+            "mean_net_return": 0.001,
+            "gross_profit_contribution": 0.65,
+        },
+        "SOLUSDT/BTCUSDT": {
+            "completed_trades": 50,
+            "profit_factor": 1.05,
+            "mean_net_return": 0.001,
+            "gross_profit_contribution": 0.35,
+        },
+    }
+    metrics["cost_stress"] = {
+        "15bps_fee_5bps_slippage": {"mean_net_return": 0.0},
+    }
+    return metrics
+
+
 def make_trial(
-    phase: str, *, passed: bool, holdout_open: bool = False,
+    phase: str, *, passed: bool, trial_id: str | None = None,
+    invalid_reasons: list[str] | None = None,
 ) -> dict[str, object]:
     return {
-        "trial_id": f"{phase}-trial",
+        "trial_id": trial_id or f"{phase}-trial",
         "recorded_at": "2026-08-14T00:00:00+00:00",
         "phase": phase,
         "params": {},
         "cost_config": {"fee_bps": 10.0, "slippage_bps": 2.0},
         "dataset_hashes": {"all": "abc"},
-        "dataset_hash": "abc",
         "common_start": COMMON_START.isoformat(),
         "common_end": COMMON_END.isoformat(),
         "metrics": make_metrics(),
+        "cost_stress": {},
         "gate": {"passed": passed, "failed_conditions": [] if passed else ["profit_factor"]},
-        "invalid_reasons": [],
-        "holdout_open": holdout_open,
+        "invalid_reasons": invalid_reasons or [],
     }
 
 
 def make_experiment_market_data() -> dict[str, bc.PairMarketData]:
     def prices(symbol: str, timeframe: str) -> pd.DataFrame:
-        interval = pd.Timedelta(hours=1) if timeframe == "1h" else pd.Timedelta(minutes=15)
-        timestamps = [COMMON_START, COMMON_END - interval]
+        frequency = "1h" if timeframe == "1h" else "15min"
+        timestamps = pd.date_range(
+            COMMON_START, COMMON_END, freq=frequency, inclusive="left",
+        )
+        close = 100.0 + np.arange(len(timestamps), dtype=float) / len(timestamps)
         return pd.DataFrame({
             "ts": timestamps,
-            "open": [100.0, 101.0],
-            "high": [101.0, 102.0],
-            "low": [99.0, 100.0],
-            "close": [100.0, 101.0],
-            "volume": [1_000.0, 1_000.0],
-            "symbol": [symbol, symbol],
+            "open": close,
+            "high": close + 1.0,
+            "low": close - 1.0,
+            "close": close,
+            "volume": np.full(len(timestamps), 1_000.0),
+            "symbol": np.full(len(timestamps), symbol),
         })
 
     funding = pd.DataFrame({
-        "ts": [COMMON_START, COMMON_END - pd.Timedelta(hours=8)],
-        "funding_rate": [0.0, 0.0],
+        "ts": pd.date_range(COMMON_START, COMMON_END, freq="8h", inclusive="left"),
+        "funding_rate": 0.0,
     })
+    btc_1h = prices("BTCUSDT", "1h")
+    btc_15m = prices("BTCUSDT", "15m")
+    btc_funding = funding.copy()
     result = {}
     for pair in pe.FIXED_PAIRS:
         alt_symbol, btc_symbol = pair.split("/")
@@ -306,13 +350,99 @@ def make_experiment_market_data() -> dict[str, bc.PairMarketData]:
             alt_symbol=alt_symbol,
             btc_symbol=btc_symbol,
             alt_1h=prices(alt_symbol, "1h"),
-            btc_1h=prices(btc_symbol, "1h"),
+            btc_1h=btc_1h.copy(),
             alt_15m=prices(alt_symbol, "15m"),
-            btc_15m=prices(btc_symbol, "15m"),
+            btc_15m=btc_15m.copy(),
             alt_funding=funding,
-            btc_funding=funding,
+            btc_funding=btc_funding.copy(),
         )
     return result
+
+
+def make_sparse_experiment_market_data() -> dict[str, bc.PairMarketData]:
+    data = make_experiment_market_data()
+    for pair, market in list(data.items()):
+        data[pair] = bc.PairMarketData(**{
+            **market.__dict__,
+            "alt_1h": market.alt_1h.iloc[[0, -1]].reset_index(drop=True),
+            "btc_1h": market.btc_1h.iloc[[0, -1]].reset_index(drop=True),
+            "alt_15m": market.alt_15m.iloc[[0, -1]].reset_index(drop=True),
+            "btc_15m": market.btc_15m.iloc[[0, -1]].reset_index(drop=True),
+        })
+    return data
+
+
+def passing_experiment_replay(data, *, window_start, window_end, config, params):
+    results = {}
+    for pair_index, pair in enumerate(pe.FIXED_PAIRS):
+        trades = [
+            make_summary_trade(
+                pair=pair,
+                net_return=-0.003 if trade_index == 0 else 0.008,
+                alt_side="LONG" if trade_index % 2 == 0 else "SHORT",
+                entry_ts=window_start + pd.Timedelta(
+                    hours=pair_index * 24 + trade_index * 3,
+                ),
+            )
+            for trade_index in range(5)
+        ]
+        results[pair] = bc.PairsBacktestResult(
+            pair=pair,
+            trades=trades,
+            metrics={},
+            invalid_reasons=[],
+        )
+    return results
+
+
+_CONCURRENT_HOLDOUT_REPLAYS = None
+
+
+def concurrent_experiment_replay(data, *, window_start, window_end, config, params):
+    if window_end - window_start == pd.Timedelta(days=90):
+        with _CONCURRENT_HOLDOUT_REPLAYS.get_lock():
+            _CONCURRENT_HOLDOUT_REPLAYS.value += 1
+    return passing_experiment_replay(
+        data,
+        window_start=window_start,
+        window_end=window_end,
+        config=config,
+        params=params,
+    )
+
+
+def run_experiment_process(
+    data, ledger_path, start_event, result_queue, holdout_replay_counter,
+):
+    global _CONCURRENT_HOLDOUT_REPLAYS
+    _CONCURRENT_HOLDOUT_REPLAYS = holdout_replay_counter
+    bc.run_pairs_backtest = concurrent_experiment_replay
+    start_event.wait()
+    try:
+        report = bc.run_pairs_experiment(
+            data,
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=Path(ledger_path),
+        )
+    except Exception as exc:  # noqa: BLE001 - child reports exact process outcome
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    else:
+        result_queue.put(("opened", report["holdout"]["opened"]))
+
+
+def append_trial_process(ledger_path, trial_id, start_event, result_queue):
+    start_event.wait()
+    try:
+        bc.write_trial_ledger(
+            Path(ledger_path),
+            make_trial("development", passed=False, trial_id=trial_id),
+        )
+    except Exception as exc:  # noqa: BLE001 - child reports exact process outcome
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+    else:
+        result_queue.put(("appended", trial_id))
 
 
 def exit_case(reason: str) -> dict[str, object]:
@@ -1357,33 +1487,7 @@ def test_hard_gate_checks_pair_concentration_stress_and_uncertainty():
 
 
 def test_hard_gate_accepts_inclusive_boundaries_and_rejects_invalid_reasons():
-    metrics = make_metrics(
-        completed_trades=100,
-        per_pair_trades={"ETHUSDT/BTCUSDT": 50, "SOLUSDT/BTCUSDT": 50},
-        profit_factor=1.25,
-        win_rate=0.52,
-        max_drawdown=0.15,
-        absolute_realized_btc_beta=0.15,
-        deflated_sharpe_probability=0.95,
-        bootstrap_mean_net_return_ci_95=[0.000001, 0.006],
-    )
-    metrics["per_pair"] = {
-        "ETHUSDT/BTCUSDT": {
-            "completed_trades": 50,
-            "profit_factor": 1.05,
-            "mean_net_return": 0.001,
-            "gross_profit_contribution": 0.65,
-        },
-        "SOLUSDT/BTCUSDT": {
-            "completed_trades": 50,
-            "profit_factor": 1.05,
-            "mean_net_return": 0.001,
-            "gross_profit_contribution": 0.35,
-        },
-    }
-    metrics["cost_stress"] = {
-        "15bps_fee_5bps_slippage": {"mean_net_return": 0.0},
-    }
+    metrics = make_hard_boundary_metrics()
 
     assert bc.hard_pass_gate(metrics) == bc.GateDecision(True, [])
     invalid = bc.hard_pass_gate({**metrics, "invalid_reasons": ["missing_funding"]})
@@ -1391,25 +1495,148 @@ def test_hard_gate_accepts_inclusive_boundaries_and_rejects_invalid_reasons():
     assert "invalid_reasons" in invalid.failed_conditions
 
 
+@pytest.mark.parametrize(
+    ("mutation", "failed_condition"),
+    [
+        (lambda metrics: metrics.update(completed_trades=99), "completed_trades"),
+        (lambda metrics: metrics["per_pair_trades"].update({"ETHUSDT/BTCUSDT": 34}), "per_pair_trades"),
+        (lambda metrics: metrics.update(profit_factor=1.2499), "profit_factor"),
+        (lambda metrics: metrics.update(win_rate=0.5199), "win_rate"),
+        (lambda metrics: metrics.update(mean_net_return=0.0), "mean_net_return"),
+        (lambda metrics: metrics.update(median_net_return=0.0), "median_net_return"),
+        (lambda metrics: metrics["per_pair"]["ETHUSDT/BTCUSDT"].update(profit_factor=1.0499), "per_pair_quality"),
+        (lambda metrics: metrics["per_pair"]["ETHUSDT/BTCUSDT"].update(mean_net_return=0.0), "per_pair_quality"),
+        (lambda metrics: metrics.update(max_drawdown=0.1501), "max_drawdown"),
+        (lambda metrics: metrics.update(absolute_realized_btc_beta=0.1501), "absolute_realized_btc_beta"),
+        (lambda metrics: metrics["per_pair"]["ETHUSDT/BTCUSDT"].update(gross_profit_contribution=0.6501), "gross_profit_concentration"),
+        (lambda metrics: metrics["cost_stress"]["15bps_fee_5bps_slippage"].update(mean_net_return=-0.0001), "15bps_fee_5bps_slippage"),
+        (lambda metrics: metrics.update(deflated_sharpe_probability=0.9499), "deflated_sharpe_probability"),
+        (lambda metrics: metrics.update(bootstrap_mean_net_return_ci_95=[-0.001, 0.001]), "bootstrap_mean_net_return_ci_95"),
+    ],
+)
+def test_every_hard_gate_threshold_rejects_just_outside_boundary(mutation, failed_condition):
+    metrics = make_hard_boundary_metrics()
+    mutation(metrics)
+
+    decision = bc.hard_pass_gate(metrics)
+
+    assert decision.passed is False
+    assert failed_condition in decision.failed_conditions
+
+
 def test_ledger_retains_failed_trials_and_refuses_second_holdout_open(tmp_path):
     ledger = tmp_path / "ledger.json"
     bc.write_trial_ledger(ledger, make_trial("development", passed=False))
-    bc.write_trial_ledger(
-        ledger,
-        make_trial("holdout", passed=True, holdout_open=True),
+    pending = make_trial(
+        "holdout",
+        passed=False,
+        invalid_reasons=["holdout_replay_pending"],
     )
+    bc._reserve_holdout(ledger, pending)
 
     with pytest.raises(ValueError, match="already opened"):
-        bc.write_trial_ledger(
+        bc._reserve_holdout(
             ledger,
-            {**make_trial("holdout", passed=True, holdout_open=True), "trial_id": "again"},
+            make_trial("holdout", passed=False, trial_id="again"),
         )
 
     persisted = json.loads(ledger.read_text())
     assert persisted["schema_version"] == 1
     assert persisted["holdout"]["status"] == "opened"
-    assert [trial["gate"]["passed"] for trial in persisted["trials"]] == [False, True]
+    assert [trial["gate"]["passed"] for trial in persisted["trials"]] == [False, False]
+    assert persisted["trials"][1]["invalid_reasons"] == ["holdout_replay_pending"]
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda trial: trial.update(extra=True), "trial keys"),
+        (lambda trial: trial.update(recorded_at="2026-08-14T01:00:00+01:00"), "recorded_at"),
+        (lambda trial: trial.update(phase="research"), "phase"),
+        (lambda trial: trial.update(dataset_hashes={"all": ""}), "dataset_hashes"),
+        (lambda trial: trial.update(trial_id=""), "trial_id"),
+    ],
+)
+def test_trial_ledger_rejects_extra_or_malformed_trial_fields(tmp_path, mutation, message):
+    ledger = tmp_path / "ledger.json"
+    trial = make_trial("development", passed=False)
+    mutation(trial)
+
+    with pytest.raises(ValueError, match=message):
+        bc.write_trial_ledger(ledger, trial)
+
+
+@pytest.mark.parametrize("location", ["top", "holdout"])
+def test_trial_ledger_rejects_extra_schema_keys(tmp_path, location):
+    ledger = tmp_path / "ledger.json"
+    document = {
+        "schema_version": 1,
+        "holdout": {
+            "status": "sealed",
+            "opened_at": None,
+            "dataset_hash": None,
+            "trial_id": None,
+        },
+        "trials": [],
+    }
+    if location == "top":
+        document["extra"] = True
+    else:
+        document["holdout"]["extra"] = True
+    ledger.write_text(json.dumps(document))
+
+    with pytest.raises(ValueError, match="keys"):
+        bc.write_trial_ledger(ledger, make_trial("development", passed=False))
+
+
+def test_trial_ledger_rejects_duplicate_trial_id(tmp_path):
+    ledger = tmp_path / "ledger.json"
+    trial = make_trial("development", passed=False)
+    bc.write_trial_ledger(ledger, trial)
+
+    with pytest.raises(ValueError, match="duplicate trial_id"):
+        bc.write_trial_ledger(ledger, trial)
+
+
+def test_concurrent_process_appends_do_not_lose_trials(tmp_path):
+    context = multiprocessing.get_context("fork")
+    ledger = tmp_path / "ledger.json"
+    bc._reserve_holdout(
+        ledger,
+        make_trial(
+            "holdout",
+            passed=False,
+            trial_id="pending-holdout",
+            invalid_reasons=["holdout_replay_pending"],
+        ),
+    )
+    start_event = context.Event()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=append_trial_process,
+            args=(str(ledger), f"trial-{index}", start_event, result_queue),
+        )
+        for index in range(8)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    results = [result_queue.get(timeout=20) for _ in processes]
+    for process in processes:
+        process.join(timeout=20)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(result[0] == "appended" for result in results)
+    persisted = json.loads(ledger.read_text())
+    assert persisted["holdout"]["status"] == "opened"
+    assert persisted["holdout"]["trial_id"] == "pending-holdout"
+    assert len(persisted["trials"]) == 9
+    assert {trial["trial_id"] for trial in persisted["trials"]} == {
+        "pending-holdout",
+        *(f"trial-{index}" for index in range(8)),
+    }
 
 
 def test_trade_summary_bootstrap_is_seeded_and_trial_penalty_is_monotone():
@@ -1447,6 +1674,85 @@ def test_trade_summary_bootstrap_is_seeded_and_trial_penalty_is_monotone():
     }
 
 
+def test_deflated_sharpe_and_drawdown_match_known_values():
+    returns = [0.01, -0.005, 0.02, 0.003, -0.002]
+    trades = [
+        make_summary_trade(
+            pair=pe.FIXED_PAIRS[index % 2],
+            net_return=net_return,
+            entry_offset=index * 24,
+        )
+        for index, net_return in enumerate(returns)
+    ]
+    drawdown_trades = [
+        make_summary_trade(
+            net_return=portfolio_return,
+            gross_notional=10_000.0,
+            equity_before=10_000.0,
+            entry_offset=index * 24,
+        )
+        for index, portfolio_return in enumerate([0.10, -0.20, 0.05])
+    ]
+
+    metrics = bc.summarize_pair_trades(trades, trial_count=4)
+    drawdown = bc.summarize_pair_trades(drawdown_trades, trial_count=1)
+
+    assert metrics["deflated_sharpe_probability"] == pytest.approx(0.4929242081662497)
+    assert drawdown["max_drawdown"] == pytest.approx(0.20)
+
+
+def test_exposure_uses_full_evaluated_duration_and_leave_one_out_is_diagnostic():
+    trades = [
+        make_summary_trade(pair="ETHUSDT/BTCUSDT", holding_hours=12),
+        make_summary_trade(pair="SOLUSDT/BTCUSDT", holding_hours=12, entry_offset=24),
+    ]
+
+    metrics = bc.summarize_pair_trades(
+        trades,
+        trial_count=1,
+        observation_duration=pd.Timedelta(days=30),
+    )
+
+    assert metrics["exposure"] == pytest.approx(24 / (30 * 24))
+    eth_omitted = metrics["leave_one_pair_out"]["ETHUSDT/BTCUSDT"]
+    assert {
+        "completed_trades",
+        "wins",
+        "win_rate",
+        "profit_factor",
+        "mean_net_return",
+        "median_net_return",
+        "sharpe",
+        "max_drawdown",
+        "exposure",
+        "absolute_realized_btc_beta",
+        "return_components",
+        "exit_counts",
+    }.issubset(eth_omitted)
+    assert "leave_one_pair_out" not in eth_omitted
+
+
+def test_no_loss_profit_factor_round_trips_as_explicit_infinity_and_passes_gate(tmp_path):
+    trades = [
+        make_summary_trade(pair=pe.FIXED_PAIRS[index % 2], entry_offset=index * 24)
+        for index in range(60)
+    ]
+    metrics = bc.summarize_pair_trades(trades, trial_count=1)
+    trial = make_trial("development", passed=True)
+    trial["metrics"] = metrics
+    ledger = tmp_path / "ledger.json"
+
+    assert metrics["profit_factor"] == float("inf")
+    assert bc.development_gate({
+        **make_metrics(),
+        "profit_factor": metrics["profit_factor"],
+    }).passed is True
+    bc.write_trial_ledger(ledger, trial)
+
+    persisted = json.loads(ledger.read_text())
+    assert persisted["trials"][0]["metrics"]["profit_factor"] == "Infinity"
+
+
 def test_cost_stress_reprices_the_same_entry_exit_ledger():
     trades = [
         make_summary_trade(net_return=0.01),
@@ -1481,6 +1787,110 @@ def test_dataset_hash_is_order_stable_and_value_sensitive():
     assert bc.dataset_hash({"left": left, "right": right.assign(close=[50.0, 52.0])}) != expected
 
 
+def test_sparse_year_spanning_timestamps_do_not_count_as_common_history(tmp_path):
+    with pytest.raises(ValueError, match=r"insufficient common coverage: .*need at least 360"):
+        bc.run_pairs_experiment(
+            make_sparse_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=False,
+            ledger_path=tmp_path / "ledger.json",
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "label"),
+    [
+        ("btc_1h", "1h"),
+        ("btc_15m", "15m"),
+        ("btc_funding", "funding"),
+    ],
+)
+def test_duplicate_btc_tapes_must_be_identical(tmp_path, monkeypatch, attribute, label):
+    data = make_experiment_market_data()
+    sol = data["SOLUSDT/BTCUSDT"]
+    mismatched = getattr(sol, attribute).copy()
+    value_column = "funding_rate" if attribute == "btc_funding" else "close"
+    mismatched.loc[mismatched.index[100], value_column] += 0.0001
+    data[sol.pair] = bc.PairMarketData(**{**sol.__dict__, attribute: mismatched})
+    monkeypatch.setattr(bc, "run_pairs_backtest", lambda data, **kwargs: {
+        pair: bc.PairsBacktestResult(pair, [], {}, []) for pair in pe.FIXED_PAIRS
+    })
+
+    with pytest.raises(ValueError, match=rf"BTCUSDT {label} tapes differ"):
+        bc.run_pairs_experiment(
+            data,
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=False,
+            ledger_path=tmp_path / "ledger.json",
+        )
+
+
+def test_isolated_common_gaps_are_allowed_when_effective_coverage_is_three_sixty_days(
+    tmp_path, monkeypatch,
+):
+    data = make_experiment_market_data()
+    missing_hour = COMMON_START + pd.Timedelta(days=10, hours=3)
+    missing_quarter = COMMON_START + pd.Timedelta(days=11, minutes=45)
+    for pair, market in list(data.items()):
+        data[pair] = bc.PairMarketData(**{
+            **market.__dict__,
+            "alt_1h": market.alt_1h.loc[market.alt_1h["ts"] != missing_hour],
+            "btc_1h": market.btc_1h.loc[market.btc_1h["ts"] != missing_hour],
+            "alt_15m": market.alt_15m.loc[market.alt_15m["ts"] != missing_quarter],
+            "btc_15m": market.btc_15m.loc[market.btc_15m["ts"] != missing_quarter],
+        })
+    monkeypatch.setattr(bc, "run_pairs_backtest", lambda data, **kwargs: {
+        pair: bc.PairsBacktestResult(pair, [], {}, []) for pair in pe.FIXED_PAIRS
+    })
+
+    report = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "ledger.json",
+    )
+
+    assert report["schedule"]["common_start"] == COMMON_START.isoformat()
+    assert report["schedule"]["common_end"] == COMMON_END.isoformat()
+
+
+def test_each_window_receives_only_its_declared_formation_and_trading_data(monkeypatch):
+    data = make_experiment_market_data()
+    window = bc.WalkForwardWindow(
+        formation_start=COMMON_START + pd.Timedelta(days=30),
+        start=COMMON_START + pd.Timedelta(days=90),
+        end=COMMON_START + pd.Timedelta(days=120),
+    )
+    inspected = []
+
+    def replay(sliced, *, window_start, window_end, config, params):
+        for market in sliced.values():
+            for frame in (market.alt_1h, market.btc_1h):
+                inspected.append((frame["ts"].min(), frame["ts"].max()))
+                assert frame["ts"].min() >= window.formation_start
+                assert frame["ts"].max() < window.end
+            for frame in (market.alt_15m, market.btc_15m):
+                inspected.append((frame["ts"].min(), frame["ts"].max()))
+                assert frame["ts"].min() >= window.formation_start
+                assert frame["ts"].max() <= window.end
+        return {
+            pair: bc.PairsBacktestResult(pair, [], {}, []) for pair in pe.FIXED_PAIRS
+        }
+
+    monkeypatch.setattr(bc, "run_pairs_backtest", replay)
+    bc._run_pairs_windows(
+        data,
+        windows=[window],
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+    )
+
+    assert inspected
+
+
 def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before_replay(
     tmp_path, monkeypatch,
 ):
@@ -1488,24 +1898,13 @@ def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before
 
     def replay(data, *, window_start, window_end, config, params):
         calls.append((window_start, window_end, config.fee_bps, config.slippage_bps))
-        results = {}
-        for pair_index, pair in enumerate(pe.FIXED_PAIRS):
-            trades = [
-                make_summary_trade(
-                    pair=pair,
-                    net_return=-0.003 if trade_index == 0 else 0.008,
-                    alt_side="LONG" if trade_index % 2 == 0 else "SHORT",
-                    entry_offset=len(calls) * 24 + pair_index * 6 + trade_index,
-                )
-                for trade_index in range(5)
-            ]
-            results[pair] = bc.PairsBacktestResult(
-                pair=pair,
-                trades=trades,
-                metrics={},
-                invalid_reasons=[],
-            )
-        return results
+        return passing_experiment_replay(
+            data,
+            window_start=window_start,
+            window_end=window_end,
+            config=config,
+            params=params,
+        )
 
     monkeypatch.setattr(bc, "run_pairs_backtest", replay)
     ledger_path = tmp_path / "ledger.json"
@@ -1525,6 +1924,7 @@ def test_experiment_opens_holdout_once_after_development_pass_and_rejects_before
     persisted = json.loads(ledger_path.read_text())
     assert persisted["holdout"]["status"] == "opened"
     assert [trial["phase"] for trial in persisted["trials"]] == ["development", "holdout"]
+    assert persisted["trials"][1]["metrics"]["trial_count"] == 2
     assert len(persisted["trials"][0]["cost_stress"]) == 9
 
     with pytest.raises(ValueError, match="already opened"):
@@ -1571,3 +1971,136 @@ def test_experiment_development_failure_keeps_holdout_sealed(tmp_path, monkeypat
     assert persisted["holdout"]["status"] == "sealed"
     assert len(persisted["trials"]) == 1
     assert persisted["trials"][0]["gate"]["passed"] is False
+
+
+def test_holdout_replay_exception_updates_pending_trial_before_reraising(tmp_path, monkeypatch):
+    calls = []
+
+    def replay(data, *, window_start, window_end, config, params):
+        calls.append((window_start, window_end))
+        if window_end - window_start == pd.Timedelta(days=90):
+            raise RuntimeError("synthetic holdout failure")
+        return passing_experiment_replay(
+            data,
+            window_start=window_start,
+            window_end=window_end,
+            config=config,
+            params=params,
+        )
+
+    monkeypatch.setattr(bc, "run_pairs_backtest", replay)
+    ledger = tmp_path / "ledger.json"
+
+    with pytest.raises(RuntimeError, match="synthetic holdout failure"):
+        bc.run_pairs_experiment(
+            make_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=ledger,
+        )
+
+    persisted = json.loads(ledger.read_text())
+    assert persisted["holdout"]["status"] == "opened"
+    assert [trial["phase"] for trial in persisted["trials"]] == ["development", "holdout"]
+    failed_holdout = persisted["trials"][1]
+    assert failed_holdout["gate"] == {
+        "passed": False,
+        "failed_conditions": ["holdout_replay_failed"],
+    }
+    assert failed_holdout["invalid_reasons"] == [
+        "holdout_replay_failed:RuntimeError:synthetic holdout failure"
+    ]
+    assert len(calls) == 8
+    with pytest.raises(ValueError, match="already opened"):
+        bc.run_pairs_experiment(
+            make_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=ledger,
+        )
+    assert len(calls) == 8
+    later_development = bc.run_pairs_experiment(
+        make_experiment_market_data(),
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=ledger,
+    )
+    assert later_development["development"]["metrics"]["trial_count"] == 3
+
+
+def test_hard_crash_leaves_pending_holdout_trial_as_consumed(tmp_path, monkeypatch):
+    def replay(data, *, window_start, window_end, config, params):
+        if window_end - window_start == pd.Timedelta(days=90):
+            raise KeyboardInterrupt("synthetic hard crash")
+        return passing_experiment_replay(
+            data,
+            window_start=window_start,
+            window_end=window_end,
+            config=config,
+            params=params,
+        )
+
+    monkeypatch.setattr(bc, "run_pairs_backtest", replay)
+    ledger = tmp_path / "ledger.json"
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic hard crash"):
+        bc.run_pairs_experiment(
+            make_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=ledger,
+        )
+
+    persisted = json.loads(ledger.read_text())
+    assert persisted["holdout"]["status"] == "opened"
+    assert persisted["trials"][-1]["phase"] == "holdout"
+    assert persisted["trials"][-1]["invalid_reasons"] == ["holdout_replay_pending"]
+
+    with pytest.raises(ValueError, match="already opened"):
+        bc.run_pairs_experiment(
+            make_experiment_market_data(),
+            config=BASE_CONFIG,
+            params=pe.DEFAULT_PARAMS,
+            open_holdout=True,
+            ledger_path=ledger,
+        )
+
+
+def test_concurrent_holdout_requests_reserve_and_replay_exactly_once(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    global _CONCURRENT_HOLDOUT_REPLAYS
+    _CONCURRENT_HOLDOUT_REPLAYS = context.Value("i", 0)
+    ledger = tmp_path / "ledger.json"
+    start_event = context.Event()
+    result_queue = context.Queue()
+    data = make_experiment_market_data()
+    processes = [
+        context.Process(
+            target=run_experiment_process,
+            args=(
+                data,
+                str(ledger),
+                start_event,
+                result_queue,
+                _CONCURRENT_HOLDOUT_REPLAYS,
+            ),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    start_event.set()
+    results = [result_queue.get(timeout=60) for _ in processes]
+    for process in processes:
+        process.join(timeout=60)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(result[0] for result in results) == ["error", "opened"]
+    assert _CONCURRENT_HOLDOUT_REPLAYS.value == 1
+    persisted = json.loads(ledger.read_text())
+    assert persisted["holdout"]["status"] == "opened"
+    assert sum(trial["phase"] == "holdout" for trial in persisted["trials"]) == 1

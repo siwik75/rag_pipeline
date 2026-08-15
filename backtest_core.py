@@ -45,6 +45,7 @@ import json
 import math
 import os
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -936,9 +937,13 @@ _TRIAL_FIELDS = {
     "common_start",
     "common_end",
     "metrics",
+    "cost_stress",
     "gate",
     "invalid_reasons",
 }
+_LEDGER_FIELDS = {"schema_version", "holdout", "trials"}
+_HOLDOUT_FIELDS = {"status", "opened_at", "dataset_hash", "trial_id"}
+_ALLOWED_TRIAL_PHASES = {"development", "holdout"}
 
 
 def _utc_timestamp(value: pd.Timestamp) -> pd.Timestamp:
@@ -1059,10 +1064,11 @@ def _deflated_sharpe_probability(returns: np.ndarray, trial_count: int) -> float
     return float(norm.cdf(statistic))
 
 
-def summarize_pair_trades(
+def _summarize_pair_trades(
     trades: list[PairTrade], *, trial_count: int,
+    observation_duration: pd.Timedelta | None,
+    include_leave_one_pair_out: bool,
 ) -> dict[str, object]:
-    """Return deterministic, JSON-safe diagnostics for one causal trade ledger."""
     ordered = sorted(trades, key=lambda trade: (trade.exit_ts, trade.entry_ts, trade.pair))
     returns = np.asarray([trade.net_return for trade in ordered], dtype=float)
     pnls = np.asarray([trade.pnl for trade in ordered], dtype=float)
@@ -1092,12 +1098,17 @@ def summarize_pair_trades(
         max((trade.exit_ts - trade.entry_ts).total_seconds(), 0.0) / 3_600.0
         for trade in ordered
     ], dtype=float)
-    elapsed_hours = (
-        max((max(trade.exit_ts for trade in ordered) - min(
-            trade.entry_ts for trade in ordered
-        )).total_seconds(), 0.0) / 3_600.0
-        if ordered else 0.0
-    )
+    if observation_duration is not None:
+        elapsed_hours = float(pd.Timedelta(observation_duration).total_seconds() / 3_600.0)
+        if elapsed_hours < 0.0:
+            raise ValueError("observation_duration must be non-negative")
+    else:
+        elapsed_hours = (
+            max((max(trade.exit_ts for trade in ordered) - min(
+                trade.entry_ts for trade in ordered
+            )).total_seconds(), 0.0) / 3_600.0
+            if ordered else 0.0
+        )
     total_holding_hours = float(durations.sum())
 
     beta_numerator = 0.0
@@ -1141,7 +1152,7 @@ def summarize_pair_trades(
     }
     long_alt = sum(trade.alt_side == "LONG" for trade in ordered)
     short_alt = sum(trade.alt_side == "SHORT" for trade in ordered)
-    return {
+    summary = {
         "completed_trades": len(ordered),
         "wins": wins,
         "win_rate": float(wins / len(ordered)) if ordered else 0.0,
@@ -1188,14 +1199,34 @@ def summarize_pair_trades(
             pair: int(summary["completed_trades"]) for pair, summary in per_pair.items()
         },
         "per_pair": per_pair,
-        "leave_one_pair_out": {
-            pair: _basic_pair_summary([trade for trade in ordered if trade.pair != pair])
-            for pair in pairs_engine.FIXED_PAIRS
-        },
         "bootstrap_block_length": max(1, round(math.sqrt(len(ordered)))) if ordered else 1,
         "bootstrap_resamples": 2_000,
         "bootstrap_mean_net_return_ci_95": _bootstrap_mean_ci(returns),
     }
+    if include_leave_one_pair_out:
+        summary["leave_one_pair_out"] = {
+            pair: _summarize_pair_trades(
+                [trade for trade in ordered if trade.pair != pair],
+                trial_count=trial_count,
+                observation_duration=observation_duration,
+                include_leave_one_pair_out=False,
+            )
+            for pair in pairs_engine.FIXED_PAIRS
+        }
+    return summary
+
+
+def summarize_pair_trades(
+    trades: list[PairTrade], *, trial_count: int,
+    observation_duration: pd.Timedelta | None = None,
+) -> dict[str, object]:
+    """Return deterministic diagnostics for one causal trade ledger."""
+    return _summarize_pair_trades(
+        trades,
+        trial_count=trial_count,
+        observation_duration=observation_duration,
+        include_leave_one_pair_out=True,
+    )
 
 
 def _numeric_at_least(metrics: dict[str, object], key: str, threshold: float) -> bool:
@@ -1321,8 +1352,12 @@ def _json_safe(value):
         return _utc_timestamp(value).isoformat()
     if isinstance(value, np.generic):
         return _json_safe(value.item())
-    if isinstance(value, float) and not np.isfinite(value):
-        return None
+    if isinstance(value, float) and np.isposinf(value):
+        return "Infinity"
+    if isinstance(value, float) and np.isneginf(value):
+        return "-Infinity"
+    if isinstance(value, float) and np.isnan(value):
+        return "NaN"
     return value
 
 
@@ -1330,19 +1365,127 @@ def _new_ledger() -> dict[str, object]:
     return json.loads(json.dumps(_LEDGER_SCHEMA))
 
 
+def _valid_utc_text(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return False
+    return (
+        timestamp.tzinfo is not None
+        and timestamp.utcoffset() is not None
+        and timestamp.utcoffset().total_seconds() == 0.0
+    )
+
+
+def _validate_trial(trial: dict[str, object]) -> None:
+    if set(trial) != _TRIAL_FIELDS:
+        raise ValueError(
+            f"invalid trial keys: expected {sorted(_TRIAL_FIELDS)}, got {sorted(trial)}"
+        )
+    if not isinstance(trial["trial_id"], str) or not trial["trial_id"]:
+        raise ValueError("trial_id must be nonempty")
+    if not _valid_utc_text(trial["recorded_at"]):
+        raise ValueError("recorded_at must be a valid UTC timestamp")
+    if trial["phase"] not in _ALLOWED_TRIAL_PHASES:
+        raise ValueError(f"phase must be one of {sorted(_ALLOWED_TRIAL_PHASES)}")
+    hashes = trial["dataset_hashes"]
+    if (
+        not isinstance(hashes, dict)
+        or not hashes
+        or not isinstance(hashes.get("all"), str)
+        or not hashes["all"]
+        or any(not isinstance(value, str) or not value for value in hashes.values())
+    ):
+        raise ValueError("dataset_hashes must contain nonempty hashes including all")
+    if not _valid_utc_text(trial["common_start"]) or not _valid_utc_text(trial["common_end"]):
+        raise ValueError("common bounds must be valid UTC timestamps")
+    if pd.Timestamp(trial["common_end"]) <= pd.Timestamp(trial["common_start"]):
+        raise ValueError("common_end must be after common_start")
+    for key in ("params", "cost_config", "metrics", "cost_stress", "gate"):
+        if not isinstance(trial[key], dict):
+            raise ValueError(f"{key} must be an object")
+    if set(trial["gate"]) != {"passed", "failed_conditions"}:
+        raise ValueError("gate keys must be passed and failed_conditions")
+    if not isinstance(trial["gate"]["passed"], bool) or not isinstance(
+        trial["gate"]["failed_conditions"], list,
+    ):
+        raise ValueError("gate has invalid values")
+    if not isinstance(trial["invalid_reasons"], list) or not all(
+        isinstance(reason, str) and reason for reason in trial["invalid_reasons"]
+    ):
+        raise ValueError("invalid_reasons must contain nonempty strings")
+
+
+def _validate_ledger(ledger: dict[str, object]) -> None:
+    if set(ledger) != _LEDGER_FIELDS:
+        raise ValueError("invalid trial ledger top-level keys")
+    if ledger.get("schema_version") != 1:
+        raise ValueError("unsupported trial ledger schema")
+    holdout = ledger.get("holdout")
+    if not isinstance(holdout, dict) or set(holdout) != _HOLDOUT_FIELDS:
+        raise ValueError("invalid holdout keys")
+    if not isinstance(ledger.get("trials"), list):
+        raise ValueError("invalid trial ledger trials")
+    trial_ids = []
+    for trial in ledger["trials"]:
+        if not isinstance(trial, dict):
+            raise ValueError("trial must be an object")
+        _validate_trial(trial)
+        trial_ids.append(trial["trial_id"])
+    if len(trial_ids) != len(set(trial_ids)):
+        raise ValueError("duplicate trial_id")
+    if holdout.get("status") == "sealed":
+        if any(holdout.get(key) is not None for key in ("opened_at", "dataset_hash", "trial_id")):
+            raise ValueError("sealed holdout metadata must be null")
+    elif holdout.get("status") == "opened":
+        if (
+            not _valid_utc_text(holdout.get("opened_at"))
+            or not isinstance(holdout.get("dataset_hash"), str)
+            or not holdout["dataset_hash"]
+            or not isinstance(holdout.get("trial_id"), str)
+            or holdout["trial_id"] not in trial_ids
+        ):
+            raise ValueError("opened holdout metadata is invalid")
+        holdout_trial = next(
+            trial for trial in ledger["trials"]
+            if trial["trial_id"] == holdout["trial_id"]
+        )
+        if holdout_trial["phase"] != "holdout":
+            raise ValueError("opened holdout trial must have holdout phase")
+    else:
+        raise ValueError("holdout status must be sealed or opened")
+
+
 def _read_trial_ledger(path: Path) -> dict[str, object]:
     if not path.exists():
         return _new_ledger()
     ledger = json.loads(path.read_text(encoding="utf-8"))
-    if ledger.get("schema_version") != 1:
-        raise ValueError("unsupported trial ledger schema")
-    if not isinstance(ledger.get("trials"), list) or not isinstance(ledger.get("holdout"), dict):
-        raise ValueError("invalid trial ledger")
+    if not isinstance(ledger, dict):
+        raise ValueError("trial ledger must be an object")
+    _validate_ledger(ledger)
     return ledger
+
+
+@contextmanager
+def _trial_ledger_lock(path: Path):
+    import fcntl
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def _write_ledger_document(path: Path, ledger: dict[str, object]) -> None:
     path = Path(path)
+    _validate_ledger(ledger)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -1363,38 +1506,90 @@ def _write_ledger_document(path: Path, ledger: dict[str, object]) -> None:
 
 
 def write_trial_ledger(path: Path, trial: dict[str, object]) -> None:
-    """Append every trial atomically and irreversibly consume a holdout opening."""
-    missing = _TRIAL_FIELDS - set(trial)
-    if missing:
-        raise ValueError(f"trial missing required fields: {sorted(missing)}")
-    ledger = _read_trial_ledger(Path(path))
-    if trial.get("holdout_open"):
+    """Append one exact-schema trial under an inter-process transaction lock."""
+    path = Path(path)
+    _validate_trial(trial)
+    with _trial_ledger_lock(path):
+        ledger = _read_trial_ledger(path)
+        if any(existing["trial_id"] == trial["trial_id"] for existing in ledger["trials"]):
+            raise ValueError(f"duplicate trial_id: {trial['trial_id']}")
+        ledger["trials"].append(_json_safe(trial))
+        _write_ledger_document(path, ledger)
+
+
+def _read_trial_ledger_snapshot(path: Path) -> dict[str, object]:
+    path = Path(path)
+    with _trial_ledger_lock(path):
+        return _read_trial_ledger(path)
+
+
+def _reserve_holdout(path: Path, pending_trial: dict[str, object]) -> int:
+    """Atomically open the holdout and append its full pending trial record."""
+    path = Path(path)
+    _validate_trial(pending_trial)
+    if pending_trial["phase"] != "holdout":
+        raise ValueError("pending holdout trial must have holdout phase")
+    with _trial_ledger_lock(path):
+        ledger = _read_trial_ledger(path)
         if ledger["holdout"].get("status") != "sealed":
             raise ValueError("holdout already opened")
+        if any(
+            existing["trial_id"] == pending_trial["trial_id"]
+            for existing in ledger["trials"]
+        ):
+            raise ValueError(f"duplicate trial_id: {pending_trial['trial_id']}")
+        ledger["trials"].append(_json_safe(pending_trial))
         ledger["holdout"] = {
             "status": "opened",
-            "opened_at": trial["recorded_at"],
-            "dataset_hash": trial.get("dataset_hash")
-            or trial.get("dataset_hashes", {}).get("all"),
-            "trial_id": trial["trial_id"],
+            "opened_at": pending_trial["recorded_at"],
+            "dataset_hash": pending_trial["dataset_hashes"]["all"],
+            "trial_id": pending_trial["trial_id"],
         }
-    ledger["trials"].append(_json_safe(trial))
-    _write_ledger_document(Path(path), ledger)
+        _write_ledger_document(path, ledger)
+        return len(ledger["trials"])
 
 
-def _reserve_holdout(
-    path: Path, *, dataset_digest: str, trial_id: str, opened_at: str,
-) -> None:
-    ledger = _read_trial_ledger(path)
-    if ledger["holdout"].get("status") != "sealed":
-        raise ValueError("holdout already opened")
-    ledger["holdout"] = {
-        "status": "opened",
-        "opened_at": opened_at,
-        "dataset_hash": dataset_digest,
-        "trial_id": trial_id,
-    }
-    _write_ledger_document(path, ledger)
+def _replace_holdout_trial(path: Path, trial: dict[str, object]) -> int:
+    path = Path(path)
+    _validate_trial(trial)
+    if trial["phase"] != "holdout":
+        raise ValueError("replacement trial must have holdout phase")
+    with _trial_ledger_lock(path):
+        ledger = _read_trial_ledger(path)
+        if ledger["holdout"].get("trial_id") != trial["trial_id"]:
+            raise ValueError("holdout trial_id does not match reservation")
+        index = next((
+            index for index, existing in enumerate(ledger["trials"])
+            if existing["trial_id"] == trial["trial_id"]
+        ), None)
+        if index is None:
+            raise ValueError("pending holdout trial not found")
+        ledger["trials"][index] = _json_safe(trial)
+        _write_ledger_document(path, ledger)
+        return len(ledger["trials"])
+
+
+def _fail_pending_holdout(path: Path, trial_id: str, reason: str) -> None:
+    path = Path(path)
+    with _trial_ledger_lock(path):
+        ledger = _read_trial_ledger(path)
+        index = next((
+            index for index, existing in enumerate(ledger["trials"])
+            if existing["trial_id"] == trial_id
+        ), None)
+        if index is None or ledger["holdout"].get("trial_id") != trial_id:
+            raise ValueError("pending holdout trial not found")
+        failed = dict(ledger["trials"][index])
+        failed["metrics"] = {}
+        failed["cost_stress"] = {}
+        failed["gate"] = {
+            "passed": False,
+            "failed_conditions": ["holdout_replay_failed"],
+        }
+        failed["invalid_reasons"] = [reason]
+        _validate_trial(failed)
+        ledger["trials"][index] = failed
+        _write_ledger_document(path, ledger)
 
 
 def _reprice_pair_trades(
@@ -1434,6 +1629,7 @@ def _reprice_pair_trades(
 
 def _cost_stress_metrics(
     trades: list[PairTrade], *, base_config: PairsBacktestConfig, trial_count: int,
+    observation_duration: pd.Timedelta | None = None,
 ) -> dict[str, dict[str, object]]:
     stress = {}
     for fee_bps, slippage_bps in _COST_STRESS_GRID:
@@ -1446,6 +1642,7 @@ def _cost_stress_metrics(
                 slippage_bps=slippage_bps,
             ),
             trial_count=trial_count,
+            observation_duration=observation_duration,
         )
     return stress
 
@@ -1455,8 +1652,7 @@ def _research_frames(
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
     if set(data) != set(pairs_engine.FIXED_PAIRS):
         raise ValueError(f"pairs experiment requires exactly {pairs_engine.FIXED_PAIRS}")
-    hash_frames = {}
-    interval_frames = {}
+    normalized_markets = {}
     for pair in pairs_engine.FIXED_PAIRS:
         market = data[pair]
         alt_symbol, btc_symbol = pair.split("/")
@@ -1466,18 +1662,45 @@ def _research_frames(
             or market.btc_symbol != btc_symbol
         ):
             raise ValueError(f"noncanonical market identity for {pair}")
-        for leg, timeframe, frame in (
-            ("alt", "1h", market.alt_1h),
-            ("btc", "1h", market.btc_1h),
-            ("alt", "15m", market.alt_15m),
-            ("btc", "15m", market.btc_15m),
-        ):
-            name = f"{pair}:{leg}:{timeframe}"
-            normalized = _pairs_frame(frame)
-            hash_frames[name] = normalized
-            interval_frames[name] = normalized
-        hash_frames[f"{pair}:alt:funding"] = _pairs_frame(market.alt_funding)
-        hash_frames[f"{pair}:btc:funding"] = _pairs_frame(market.btc_funding)
+        normalized_markets[pair] = {
+            "alt_1h": _pairs_frame(market.alt_1h),
+            "btc_1h": _pairs_frame(market.btc_1h),
+            "alt_15m": _pairs_frame(market.alt_15m),
+            "btc_15m": _pairs_frame(market.btc_15m),
+            "alt_funding": _pairs_frame(market.alt_funding),
+            "btc_funding": _pairs_frame(market.btc_funding),
+        }
+
+    first, second = (normalized_markets[pair] for pair in pairs_engine.FIXED_PAIRS)
+    for attribute, label in (
+        ("btc_1h", "1h"),
+        ("btc_15m", "15m"),
+        ("btc_funding", "funding"),
+    ):
+        left = first[attribute]
+        right = second[attribute]
+        if set(left.columns) != set(right.columns) or not left.loc[
+            :, sorted(left.columns)
+        ].equals(right.loc[:, sorted(right.columns)]):
+            raise ValueError(f"BTCUSDT {label} tapes differ between pair records")
+
+    eth = normalized_markets["ETHUSDT/BTCUSDT"]
+    sol = normalized_markets["SOLUSDT/BTCUSDT"]
+    hash_frames = {
+        "ETHUSDT:1h": eth["alt_1h"],
+        "ETHUSDT:15m": eth["alt_15m"],
+        "ETHUSDT:funding": eth["alt_funding"],
+        "SOLUSDT:1h": sol["alt_1h"],
+        "SOLUSDT:15m": sol["alt_15m"],
+        "SOLUSDT:funding": sol["alt_funding"],
+        "BTCUSDT:1h": eth["btc_1h"],
+        "BTCUSDT:15m": eth["btc_15m"],
+        "BTCUSDT:funding": eth["btc_funding"],
+    }
+    interval_frames = {
+        name: frame for name, frame in hash_frames.items()
+        if name.endswith(":1h") or name.endswith(":15m")
+    }
     return hash_frames, interval_frames
 
 
@@ -1495,7 +1718,23 @@ def _common_history_bounds(
     common_start = max(starts).ceil("1h")
     common_end = min(ends).floor("1h")
     if common_end <= common_start:
-        raise ValueError("insufficient common history: 0 days; need at least 360")
+        raise ValueError("insufficient common coverage: 0 days; need at least 360")
+    effective_days = []
+    for suffix, bars_per_day in ((":1h", 24), (":15m", 96)):
+        timestamp_sets = [
+            set(frame.loc[
+                (frame["ts"] >= common_start) & (frame["ts"] < common_end), "ts"
+            ])
+            for name, frame in interval_frames.items()
+            if name.endswith(suffix)
+        ]
+        synchronized = set.intersection(*timestamp_sets)
+        effective_days.append(len(synchronized) / bars_per_day)
+    common_days = min(effective_days)
+    if common_days < 360.0:
+        raise ValueError(
+            f"insufficient common coverage: {math.floor(common_days)} days; need at least 360"
+        )
     return common_start, common_end
 
 
@@ -1503,11 +1742,37 @@ def _run_pairs_windows(
     data: dict[str, PairMarketData], *, windows: list[WalkForwardWindow],
     config: PairsBacktestConfig, params: pairs_engine.PairsParams,
 ) -> tuple[list[PairTrade], list[str]]:
+    if params.formation_hours != 60 * 24:
+        raise ValueError("pairs walk-forward requires a fixed 60-day formation window")
     trades = []
     invalid_reasons = []
     for window in windows:
+        if window.start - window.formation_start != pd.Timedelta(days=60):
+            raise ValueError("walk-forward formation interval must be exactly 60 days")
+        sliced_data = {}
+        for pair, market in data.items():
+            fields = dict(market.__dict__)
+            for attribute in ("alt_1h", "btc_1h"):
+                frame = _pairs_frame(getattr(market, attribute))
+                fields[attribute] = frame.loc[
+                    (frame["ts"] >= window.formation_start)
+                    & (frame["ts"] < window.end)
+                ].reset_index(drop=True)
+            for attribute in ("alt_15m", "btc_15m"):
+                frame = _pairs_frame(getattr(market, attribute))
+                fields[attribute] = frame.loc[
+                    (frame["ts"] >= window.formation_start)
+                    & (frame["ts"] <= window.end)
+                ].reset_index(drop=True)
+            for attribute in ("alt_funding", "btc_funding"):
+                frame = _pairs_frame(getattr(market, attribute))
+                fields[attribute] = frame.loc[
+                    (frame["ts"] >= window.formation_start)
+                    & (frame["ts"] <= window.end)
+                ].reset_index(drop=True)
+            sliced_data[pair] = PairMarketData(**fields)
         results = run_pairs_backtest(
-            data,
+            sliced_data,
             window_start=window.start,
             window_end=window.end,
             config=config,
@@ -1534,7 +1799,6 @@ def _trial_record(
         "params": asdict(params),
         "cost_config": asdict(config),
         "dataset_hashes": dataset_hashes,
-        "dataset_hash": dataset_hashes["all"],
         "common_start": schedule.common_start.isoformat(),
         "common_end": schedule.common_end.isoformat(),
         "metrics": metrics,
@@ -1567,7 +1831,7 @@ def run_pairs_experiment(
 ) -> dict[str, object]:
     """Run development validation and, at most once, the sealed holdout."""
     ledger_path = Path(ledger_path)
-    initial_ledger = _read_trial_ledger(ledger_path)
+    initial_ledger = _read_trial_ledger_snapshot(ledger_path)
     if open_holdout and initial_ledger["holdout"].get("status") != "sealed":
         raise ValueError("holdout already opened")
     historical_trial_count = len(initial_ledger["trials"])
@@ -1581,6 +1845,10 @@ def run_pairs_experiment(
     dataset_hashes["all"] = dataset_hash(hash_frames)
 
     nominal_config = replace(config, fee_bps=10.0, slippage_bps=2.0)
+    development_duration = sum(
+        (window.end - window.start for window in schedule.development_windows),
+        pd.Timedelta(0),
+    )
     development_trades, development_invalid = _run_pairs_windows(
         data,
         windows=schedule.development_windows,
@@ -1589,12 +1857,15 @@ def run_pairs_experiment(
     )
     development_trial_count = historical_trial_count + 1
     development_metrics = summarize_pair_trades(
-        development_trades, trial_count=development_trial_count,
+        development_trades,
+        trial_count=development_trial_count,
+        observation_duration=development_duration,
     )
     development_cost_stress = _cost_stress_metrics(
         development_trades,
         base_config=nominal_config,
         trial_count=development_trial_count,
+        observation_duration=development_duration,
     )
     development_metrics["cost_stress"] = development_cost_stress
     development_metrics["invalid_reasons"] = development_invalid
@@ -1637,31 +1908,50 @@ def run_pairs_experiment(
 
     holdout_trial_id = uuid.uuid4().hex
     holdout_recorded_at = datetime.now(timezone.utc).isoformat()
-    _reserve_holdout(
-        ledger_path,
-        dataset_digest=dataset_hashes["all"],
+    pending_holdout = _trial_record(
+        phase="holdout",
         trial_id=holdout_trial_id,
-        opened_at=holdout_recorded_at,
+        recorded_at=holdout_recorded_at,
+        params=params,
+        config=nominal_config,
+        dataset_hashes=dataset_hashes,
+        schedule=schedule,
+        metrics={},
+        gate=GateDecision(False, ["holdout_replay_pending"]),
+        invalid_reasons=["holdout_replay_pending"],
+        cost_stress={},
     )
+    _reserve_holdout(ledger_path, pending_holdout)
     holdout_window = WalkForwardWindow(
         formation_start=schedule.holdout_start - pd.Timedelta(days=60),
         start=schedule.holdout_start,
         end=schedule.common_end,
     )
-    holdout_trades, holdout_invalid = _run_pairs_windows(
-        data,
-        windows=[holdout_window],
-        config=nominal_config,
-        params=params,
-    )
+    try:
+        holdout_trades, holdout_invalid = _run_pairs_windows(
+            data,
+            windows=[holdout_window],
+            config=nominal_config,
+            params=params,
+        )
+    except Exception as exc:
+        reason = f"holdout_replay_failed:{type(exc).__name__}:{exc}"
+        _fail_pending_holdout(ledger_path, holdout_trial_id, reason)
+        raise
     combined_trades = development_trades + holdout_trades
     combined_invalid = list(dict.fromkeys(development_invalid + holdout_invalid))
-    hard_trial_count = historical_trial_count + 2
-    hard_metrics = summarize_pair_trades(combined_trades, trial_count=hard_trial_count)
+    hard_trial_count = len(_read_trial_ledger_snapshot(ledger_path)["trials"])
+    combined_duration = development_duration + (holdout_window.end - holdout_window.start)
+    hard_metrics = summarize_pair_trades(
+        combined_trades,
+        trial_count=hard_trial_count,
+        observation_duration=combined_duration,
+    )
     hard_cost_stress = _cost_stress_metrics(
         combined_trades,
         base_config=nominal_config,
         trial_count=hard_trial_count,
+        observation_duration=combined_duration,
     )
     hard_metrics["cost_stress"] = hard_cost_stress
     hard_metrics["invalid_reasons"] = combined_invalid
@@ -1679,7 +1969,7 @@ def run_pairs_experiment(
         invalid_reasons=combined_invalid,
         cost_stress=hard_cost_stress,
     )
-    write_trial_ledger(ledger_path, holdout_trial)
+    _replace_holdout_trial(ledger_path, holdout_trial)
     report["holdout"] = {
         "requested": True,
         "opened": True,
