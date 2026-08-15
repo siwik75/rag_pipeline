@@ -29,6 +29,7 @@ class PairsParams:
 
 
 DEFAULT_PARAMS = PairsParams()
+FIXED_PAIRS = ("ETHUSDT/BTCUSDT", "SOLUSDT/BTCUSDT")
 
 
 @dataclass(frozen=True)
@@ -49,10 +50,14 @@ class RelationshipSnapshot:
 
 @dataclass(frozen=True)
 class PairObservation:
+    pair: str
     ts: pd.Timestamp
     snapshot: RelationshipSnapshot | None
     zscore: float | None
     direction: str | None
+
+    def __post_init__(self) -> None:
+        _require_canonical_pair(self.pair)
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,11 @@ def align_hourly_prices(alt_1h: pd.DataFrame, btc_1h: pd.DataFrame) -> pd.DataFr
         & (hourly["btc_close"] > 0.0)
     )
     return hourly.loc[valid].sort_values("ts").reset_index(drop=True)
+
+
+def _require_canonical_pair(pair: str) -> None:
+    if pair not in FIXED_PAIRS:
+        raise ValueError(f"pair must be one of {FIXED_PAIRS}")
 
 
 def _valid_history(history: pd.DataFrame, params: PairsParams) -> pd.DataFrame | None:
@@ -225,6 +235,7 @@ def fit_relationship(
 def _snapshot_row(observation: PairObservation) -> dict[str, object]:
     snapshot = observation.snapshot
     row: dict[str, object] = {
+        "pair": observation.pair,
         "ts": observation.ts,
         "zscore": observation.zscore,
         "direction": observation.direction,
@@ -235,19 +246,25 @@ def _snapshot_row(observation: PairObservation) -> dict[str, object]:
     return row
 
 
-def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.DataFrame:
+def build_hourly_observations(
+    hourly: pd.DataFrame,
+    params: PairsParams,
+    *,
+    pair: str,
+) -> pd.DataFrame:
     """Build one causal relationship observation for each completed hourly bar.
 
     At timestamp ``t`` the model sees only the 1,440 rows immediately before
     ``t``; ``t`` is used solely to calculate the current residual and z-score.
     """
+    _require_canonical_pair(pair)
     clean = _valid_history(hourly, replace(
         params,
         formation_hours=max(len(hourly), params.formation_hours),
         min_observations=0,
     ))
     if clean is None:
-        return pd.DataFrame(columns=["ts", "zscore", "direction", "snapshot", "beta"])
+        return pd.DataFrame(columns=["pair", "ts", "zscore", "direction", "snapshot", "beta"])
 
     snapshots: dict[pd.Timestamp, RelationshipSnapshot | None] = {}
     rows: list[dict[str, object]] = []
@@ -255,7 +272,7 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
         ts = current["ts"]
         if index < params.formation_hours:
             snapshots[ts] = None
-            rows.append(_snapshot_row(PairObservation(ts, None, None, None)))
+            rows.append(_snapshot_row(PairObservation(pair, ts, None, None, None)))
             continue
         history = clean.iloc[max(0, index - params.formation_hours):index]
         baseline = snapshots.get(ts - pd.Timedelta(hours=24))
@@ -287,7 +304,7 @@ def build_hourly_observations(hourly: pd.DataFrame, params: PairsParams) -> pd.D
                     direction = "SHORT_ALT_LONG_BTC"
                 elif baseline_stable and zscore <= -params.entry_z:
                     direction = "LONG_ALT_SHORT_BTC"
-        rows.append(_snapshot_row(PairObservation(ts, snapshot, zscore, direction)))
+        rows.append(_snapshot_row(PairObservation(pair, ts, snapshot, zscore, direction)))
 
     return pd.DataFrame(rows)
 
@@ -313,7 +330,7 @@ def make_signal(observation: PairObservation, params: PairsParams) -> PairSignal
     else:
         alt_side, btc_side = "LONG", "SHORT"
     return PairSignal(
-        pair="",
+        pair=observation.pair,
         decision_ts=observation.ts,
         beta=snapshot.beta,
         zscore=float(zscore),

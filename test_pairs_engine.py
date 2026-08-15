@@ -6,7 +6,12 @@ import pytest
 import pairs_engine as pe
 
 
-def make_observation(zscore: float | None, beta: float, stable: bool = True) -> pe.PairObservation:
+def make_observation(
+    zscore: float | None,
+    beta: float,
+    stable: bool = True,
+    pair: str = "ETHUSDT/BTCUSDT",
+) -> pe.PairObservation:
     snapshot = pe.RelationshipSnapshot(
         alpha=0.3,
         beta=beta,
@@ -22,6 +27,7 @@ def make_observation(zscore: float | None, beta: float, stable: bool = True) -> 
         rejection_reason=None if stable else "beta_change",
     )
     return pe.PairObservation(
+        pair=pair,
         ts=pd.Timestamp("2024-01-01T00:00:00Z"),
         snapshot=snapshot,
         zscore=zscore,
@@ -106,11 +112,11 @@ def make_negative_beta_hourly(hours: int) -> pd.DataFrame:
 
 def test_fit_uses_only_history_before_decision():
     hourly = make_cointegrated_hourly(hours=1_500)
-    first = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+    first = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="ETHUSDT/BTCUSDT")
     mutated = hourly.copy()
     mutation_index = 1_470
     mutated.loc[mutated.index >= mutation_index, "alt_close"] *= 100.0
-    second = pe.build_hourly_observations(mutated, pe.DEFAULT_PARAMS)
+    second = pe.build_hourly_observations(mutated, pe.DEFAULT_PARAMS, pair="ETHUSDT/BTCUSDT")
     compared = first.loc[first["ts"] < hourly.loc[mutation_index, "ts"]]
     assert compared["snapshot"].notna().any()
     pd.testing.assert_series_equal(
@@ -130,7 +136,7 @@ def test_positive_cointegrated_history_passes_all_stability_gates():
 
 def test_observations_wait_for_a_full_formation_window():
     hourly = make_cointegrated_hourly(hours=1_500)
-    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="ETHUSDT/BTCUSDT")
     early = observations.loc[observations["ts"] < hourly.loc[1_440, "ts"]]
     assert early["snapshot"].isna().all()
 
@@ -140,7 +146,7 @@ def test_unstable_baseline_cannot_emit_direction():
     current_index = 1_464
     hourly.loc[current_index, "alt_close"] *= 1.05
 
-    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="ETHUSDT/BTCUSDT")
     baseline = observations.loc[1_440, "snapshot"]
     current = observations.loc[current_index]
 
@@ -153,7 +159,7 @@ def test_unstable_baseline_cannot_emit_direction():
 
 def test_short_input_keeps_timestamps_with_null_observations():
     hourly = make_cointegrated_hourly(hours=1_199)
-    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS)
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="ETHUSDT/BTCUSDT")
 
     pd.testing.assert_series_equal(observations["ts"], hourly["ts"], check_names=False)
     assert observations["snapshot"].isna().all()
@@ -187,3 +193,53 @@ def test_confirmation_requires_reversion_then_expires_after_four_closed_bars():
 @pytest.mark.parametrize("reason", ["convergence", "divergence_stop", "time_stop", "structural", "data_gap"])
 def test_exit_classification_uses_only_pair_level_rules(reason):
     assert pe.classify_exit(**exit_case(reason), params=pe.DEFAULT_PARAMS).reason == reason
+
+
+@pytest.mark.parametrize("pair", ["ETHUSDT/BTCUSDT", "SOLUSDT/BTCUSDT"])
+def test_canonical_pair_identity_propagates_through_observations_and_signals(pair):
+    hourly = make_cointegrated_hourly(hours=1_199)
+    observations = pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair=pair)
+    signal = pe.make_signal(make_observation(zscore=2.25, beta=2.0, pair=pair), pe.DEFAULT_PARAMS)
+
+    assert observations["pair"].eq(pair).all()
+    assert signal.pair == pair
+
+
+@pytest.mark.parametrize("pair", ["", "ETHUSDT/BTCUSDT ", "XRPUSDT/BTCUSDT"])
+def test_pair_observation_rejects_noncanonical_identity(pair):
+    with pytest.raises(ValueError, match="pair"):
+        make_observation(zscore=2.25, beta=2.0, pair=pair)
+
+
+def test_hourly_observation_builder_requires_canonical_pair_identity():
+    hourly = make_cointegrated_hourly(hours=1_199)
+
+    with pytest.raises(ValueError, match="pair"):
+        pe.build_hourly_observations(hourly, pe.DEFAULT_PARAMS, pair="")
+
+
+def test_exit_classification_prioritizes_structural_then_data_gap_then_divergence():
+    entry_ts = pd.Timestamp("2024-01-01T00:00:00Z")
+    common = {
+        "zscore": 3.5,
+        "entry_ts": entry_ts,
+        "decision_ts": entry_ts + pd.Timedelta(hours=72),
+        "consecutive_missing_bars": 2,
+        "params": pe.DEFAULT_PARAMS,
+    }
+
+    assert pe.classify_exit(stable=False, **common).reason == "structural"
+    assert pe.classify_exit(stable=True, **common).reason == "data_gap"
+    assert pe.classify_exit(
+        stable=True,
+        consecutive_missing_bars=0,
+        **{key: value for key, value in common.items() if key != "consecutive_missing_bars"},
+    ).reason == "divergence_stop"
+    assert pe.classify_exit(
+        zscore=0.5,
+        stable=True,
+        entry_ts=entry_ts,
+        decision_ts=entry_ts + pd.Timedelta(hours=72),
+        consecutive_missing_bars=0,
+        params=pe.DEFAULT_PARAMS,
+    ).reason == "convergence"
