@@ -2160,6 +2160,31 @@ def test_trial_id_is_deterministic_for_fixed_phase_params_costs_and_frames(
     assert first["development"]["trial_id"] == second["development"]["trial_id"]
 
 
+def test_same_cached_frames_produce_identical_report_and_dataset_hash(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
+    data = make_experiment_market_data()
+
+    first = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "one.json",
+    )
+    second = bc.run_pairs_experiment(
+        data,
+        config=BASE_CONFIG,
+        params=pe.DEFAULT_PARAMS,
+        open_holdout=False,
+        ledger_path=tmp_path / "two.json",
+    )
+
+    assert first["dataset_hashes"] == second["dataset_hashes"]
+    assert first["development"]["metrics"] == second["development"]["metrics"]
+
+
 def test_identical_development_rerun_is_idempotent_in_one_ledger(tmp_path, monkeypatch):
     monkeypatch.setattr(bc, "run_pairs_backtest", passing_experiment_replay)
     ledger = tmp_path / "ledger.json"
